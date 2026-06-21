@@ -105,6 +105,54 @@ def adaptive_terrain_around_path(
     return terrain_around_path(xy, resolution_m=resolution, margin_m=margin_m)
 
 
+def webgl_terrain_payload(
+    terrain: TerrainGrid,
+    flight_xyz: np.ndarray,
+    sun_azimuth: np.ndarray,
+    max_grid_side: int = 320,
+    max_path_points: int = 1800,
+) -> dict:
+    """Build a compact JSON-serializable terrain payload for browser rendering."""
+
+    xy = flight_xyz[:, :2]
+    center = np.array([
+        (float(xy[:, 0].min()) + float(xy[:, 0].max())) / 2,
+        (float(xy[:, 1].min()) + float(xy[:, 1].max())) / 2,
+    ])
+    radius = float(np.linalg.norm(xy - center, axis=1).max() + 300)
+
+    terrain_step = max(1, int(np.ceil(max(len(terrain.x), len(terrain.y)) / max_grid_side)))
+    x = terrain.x[::terrain_step]
+    y = terrain.y[::terrain_step]
+    z = terrain.z[::terrain_step, ::terrain_step]
+
+    path_step = max(1, int(np.ceil(len(flight_xyz) / max_path_points)))
+    path = flight_xyz[::path_step]
+
+    return {
+        "terrain": {
+            "x0": float(x[0]),
+            "y0": float(y[0]),
+            "dx": float(np.mean(np.diff(x))) if len(x) > 1 else 1.0,
+            "dy": float(np.mean(np.diff(y))) if len(y) > 1 else 1.0,
+            "width": int(len(x)),
+            "height": int(len(y)),
+            "z": z.astype(float).ravel().tolist(),
+            "zMin": float(np.nanmin(z)),
+            "zMax": float(np.nanmax(z)),
+        },
+        "circle": {
+            "center": center.astype(float).tolist(),
+            "radius": radius,
+        },
+        "flightPath": path.astype(float).tolist(),
+        "sun": {
+            "startAzimuth": float(sun_azimuth[0]),
+            "endAzimuth": float(sun_azimuth[-1]),
+        },
+    }
+
+
 def terrain_heights(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return sample_points(np.asarray(x), np.asarray(y))
 
