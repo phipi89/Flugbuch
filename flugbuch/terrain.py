@@ -68,9 +68,14 @@ def terrain_around_path(
 ) -> TerrainGrid:
     span = float(max(xy[:, 0].ptp(), xy[:, 1].ptp()))
     margin = margin_m if margin_m is not None else max(1000.0, span * margin_factor)
+    center = np.array([
+        (float(xy[:, 0].min()) + float(xy[:, 0].max())) / 2,
+        (float(xy[:, 1].min()) + float(xy[:, 1].max())) / 2,
+    ])
+    radius = float(np.linalg.norm(xy - center, axis=1).max() + margin)
 
-    x = np.arange(xy[:, 0].min() - margin, xy[:, 0].max() + margin + resolution_m, resolution_m)
-    y = np.arange(xy[:, 1].min() - margin, xy[:, 1].max() + margin + resolution_m, resolution_m)
+    x = np.arange(center[0] - radius, center[0] + radius + resolution_m, resolution_m)
+    y = np.arange(center[1] - radius, center[1] + radius + resolution_m, resolution_m)
     xx, yy = np.meshgrid(x, y, indexing="xy")
     z = sample_points(xx, yy)
 
@@ -90,9 +95,12 @@ def adaptive_terrain_around_path(
 ) -> TerrainGrid:
     """Sample terrain around a path at the sharpest interactive resolution."""
 
-    width = float(xy[:, 0].max() - xy[:, 0].min() + 2 * margin_m)
-    height = float(xy[:, 1].max() - xy[:, 1].min() + 2 * margin_m)
-    resolution = max(width, height) / max_grid_side
+    center = np.array([
+        (float(xy[:, 0].min()) + float(xy[:, 0].max())) / 2,
+        (float(xy[:, 1].min()) + float(xy[:, 1].max())) / 2,
+    ])
+    diameter = 2 * float(np.linalg.norm(xy - center, axis=1).max() + margin_m)
+    resolution = diameter / max_grid_side
     resolution = float(np.clip(resolution, min_resolution_m, max_resolution_m))
     return terrain_around_path(xy, resolution_m=resolution, margin_m=margin_m)
 

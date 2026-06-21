@@ -52,6 +52,7 @@ class Flight:
     time: np.ndarray
     velocity: np.ndarray
     ground_speed_ms: np.ndarray
+    sun_azimuth: np.ndarray
     sun_direction: np.ndarray
     mean_sun_direction: np.ndarray
     wind_vector_ms: np.ndarray
@@ -154,6 +155,7 @@ def load_flight(path: str | Path) -> Flight:
         time=time,
         velocity=velocity,
         ground_speed_ms=ground_speed_ms,
+        sun_azimuth=sun_azimuth,
         sun_direction=sun_direction,
         mean_sun_direction=mean_sun_direction,
         wind_vector_ms=np.array([wind_x, wind_y]),

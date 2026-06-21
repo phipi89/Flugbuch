@@ -24,6 +24,19 @@ def terrain_figure(flight: Flight, terrain: TerrainGrid | None = None) -> go.Fig
     elevation = (terrain.z - np.nanmin(terrain.z)) / (np.nanmax(terrain.z) - np.nanmin(terrain.z))
     shaded_relief = np.clip(0.68 * exposure + 0.32 * elevation, 0, 1)
 
+    center = np.array([
+        (float(flight.x.min()) + float(flight.x.max())) / 2,
+        (float(flight.y.min()) + float(flight.y.max())) / 2,
+    ])
+    radius = float(np.linalg.norm(flight.xy - center, axis=1).max() + 300)
+    outer_radius = radius * 1.14
+
+    sun_angles = np.unwrap(-(flight.sun_azimuth + np.pi / 2))
+    sun_arc_angles = np.linspace(float(sun_angles[0]), float(sun_angles[-1]), 80)
+    sun_arc_radius = radius * 1.065
+    sun_arc_x = center[0] + sun_arc_radius * np.cos(sun_arc_angles)
+    sun_arc_y = center[1] + sun_arc_radius * np.sin(sun_arc_angles)
+
     fig = go.Figure()
     fig.add_trace(
         go.Heatmap(
@@ -52,6 +65,37 @@ def terrain_figure(flight: Flight, terrain: TerrainGrid | None = None) -> go.Fig
             line=dict(color="rgba(255,255,255,0.22)", width=0.5),
             showscale=False,
             hoverinfo="skip",
+        )
+    )
+    fig.add_shape(
+        type="circle",
+        xref="x",
+        yref="y",
+        x0=center[0] - radius,
+        y0=center[1] - radius,
+        x1=center[0] + radius,
+        y1=center[1] + radius,
+        line=dict(color="rgba(255,255,255,0.72)", width=1.5),
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=sun_arc_x,
+            y=sun_arc_y,
+            mode="lines",
+            line=dict(color="#f59e0b", width=5),
+            name="sun travel",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[sun_arc_x[0], sun_arc_x[-1]],
+            y=[sun_arc_y[0], sun_arc_y[-1]],
+            mode="markers",
+            marker=dict(color=["#fde68a", "#f97316"], size=[8, 11], line=dict(color="#0b1020", width=1)),
+            name="sun start / landing",
+            hovertemplate="%{text}<extra></extra>",
+            text=["sun at takeoff", "sun at landing"],
         )
     )
     fig.add_trace(
@@ -83,8 +127,8 @@ def terrain_figure(flight: Flight, terrain: TerrainGrid | None = None) -> go.Fig
         )
     )
 
-    fig.update_yaxes(scaleanchor="x", scaleratio=1, visible=False)
-    fig.update_xaxes(visible=False)
+    fig.update_yaxes(scaleanchor="x", scaleratio=1, range=[center[1] - outer_radius, center[1] + outer_radius], visible=False)
+    fig.update_xaxes(range=[center[0] - outer_radius, center[0] + outer_radius], visible=False)
     fig.update_layout(
         title="Terrain shaded by actual sun exposure",
         height=720,
