@@ -14,6 +14,10 @@
     dragStartAzimuth: 0,
     viewMode: "isometric",
     dragInstalled: false,
+    focusIndex: 0,
+    cutoutRadius: 1200,
+    minCutoutRadius: 450,
+    maxCutoutRadius: 1200,
   };
 
   const SHADE_LIGHT = new THREE.Vector3(-0.45, 0.72, -0.52).normalize();
@@ -44,12 +48,28 @@
     return new THREE.Vector3(-dzdx, 1, dzdy).normalize();
   }
 
+  function terrainNormalAtPoint(terrain, x, y) {
+    const step = Math.max(terrain.dx, terrain.dy);
+    const dzdx = (sampleHeight(terrain, x + step, y) - sampleHeight(terrain, x - step, y)) / (2 * step);
+    const dzdy = (sampleHeight(terrain, x, y + step) - sampleHeight(terrain, x, y - step)) / (2 * step);
+    return new THREE.Vector3(-dzdx, 1, dzdy).normalize();
+  }
+
   function localX(x, center) {
     return x - center[0];
   }
 
   function localY(y, center) {
     return -(y - center[1]);
+  }
+
+  function viewCenter() {
+    const point = state.data.flightPath[Math.min(state.focusIndex, state.data.flightPath.length - 1)];
+    return [point[0], point[1]];
+  }
+
+  function viewRadius() {
+    return Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius));
   }
 
   function sampleHeight(terrain, x, y) {
@@ -114,13 +134,31 @@
     container.addEventListener("pointercancel", () => {
       state.dragging = false;
     });
+
+    container.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const factor = Math.exp(event.deltaY * 0.0012);
+      state.cutoutRadius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius * factor));
+      rebuildGeometry();
+    }, { passive: false });
+  }
+
+  function installScrubber() {
+    const scrubber = document.getElementById("scrub");
+    if (!scrubber || !state.data) return;
+    scrubber.max = String(Math.max(0, state.data.flightPath.length - 1));
+    scrubber.value = String(state.focusIndex);
+    scrubber.addEventListener("input", () => {
+      state.focusIndex = Number(scrubber.value);
+      rebuildGeometry();
+    });
   }
 
   function buildTerrain(data) {
     console.time("[terrain] build terrain mesh");
     const terrain = data.terrain;
-    const center = data.circle.center;
-    const radius = data.circle.radius;
+    const center = viewCenter();
+    const radius = viewRadius();
     const baseHeight = terrain.zMin - Math.max(100, (terrain.zMax - terrain.zMin) * 0.14);
     const positions = [];
     const colors = [];
@@ -163,16 +201,58 @@
     const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
     state.root.add(new THREE.Mesh(geometry, material));
 
+    buildEdgeFill(data);
     buildCylinderWall(data, baseHeight);
     console.timeEnd("[terrain] build terrain mesh");
     console.log("[terrain] terrain mesh ready", { vertices: positions.length / 3, triangles: indices.length / 3 });
   }
 
+  function buildEdgeFill(data) {
+    console.time("[terrain] build edge fill");
+    const terrain = data.terrain;
+    const center = viewCenter();
+    const radius = viewRadius();
+    const innerRadius = Math.max(1, radius - Math.max(terrain.dx, terrain.dy) * 2.2);
+    const segments = 256;
+    const positions = [];
+    const colors = [];
+    const indices = [];
+
+    for (let i = 0; i <= segments; i += 1) {
+      const angle = (i / segments) * Math.PI * 2;
+      for (const r of [innerRadius, radius]) {
+        const x = center[0] + Math.cos(angle) * r;
+        const y = center[1] + Math.sin(angle) * r;
+        const z = sampleHeight(terrain, x, y);
+        positions.push(localX(x, center), z + 1, localY(y, center));
+        const color = colorForNormal(terrainNormalAtPoint(terrain, x, y));
+        colors.push(color.r, color.g, color.b);
+      }
+    }
+
+    for (let i = 0; i < segments; i += 1) {
+      const inner0 = i * 2;
+      const outer0 = inner0 + 1;
+      const inner1 = inner0 + 2;
+      const outer1 = inner0 + 3;
+      indices.push(inner0, outer0, inner1, inner1, outer0, outer1);
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    state.root.add(new THREE.Mesh(geometry, material));
+    console.timeEnd("[terrain] build edge fill");
+  }
+
   function buildCylinderWall(data, baseHeight) {
     console.time("[terrain] build cylinder wall");
     const terrain = data.terrain;
-    const center = data.circle.center;
-    const radius = data.circle.radius;
+    const center = viewCenter();
+    const radius = viewRadius();
     const segments = 192;
     const positions = [];
     const colors = [];
@@ -213,13 +293,27 @@
 
   function buildOverlays(data) {
     console.time("[terrain] build overlays");
-    const center = data.circle.center;
+    const center = viewCenter();
     const terrain = data.terrain;
-    const circleRadius = data.circle.radius;
+    const circleRadius = viewRadius();
     const topLift = 26;
 
-    const pathPoints = data.flightPath.map((point) => new THREE.Vector3(localX(point[0], center), point[2] + topLift, localY(point[1], center)));
+    const pathPoints = data.flightPath
+      .filter((point) => {
+        const dx = point[0] - center[0];
+        const dy = point[1] - center[1];
+        return dx * dx + dy * dy <= circleRadius * circleRadius * 1.8;
+      })
+      .map((point) => new THREE.Vector3(localX(point[0], center), point[2] + topLift, localY(point[1], center)));
     state.root.add(buildLine(pathPoints, 0xffffff, 3));
+
+    const focusPoint = data.flightPath[Math.min(state.focusIndex, data.flightPath.length - 1)];
+    const marker = new THREE.Mesh(
+      new THREE.SphereGeometry(Math.max(18, circleRadius * 0.018), 24, 12),
+      new THREE.MeshBasicMaterial({ color: 0xf97316 })
+    );
+    marker.position.set(localX(focusPoint[0], center), focusPoint[2] + topLift + 28, localY(focusPoint[1], center));
+    state.root.add(marker);
 
     const rim = [];
     for (let i = 0; i <= 192; i += 1) {
@@ -254,7 +348,7 @@
 
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
-    const radius = state.data.circle.radius;
+    const radius = viewRadius();
     const terrain = state.data.terrain;
     const aspect = width / height;
     const frustum = radius * 2.55;
@@ -281,7 +375,33 @@
     state.camera.updateProjectionMatrix();
     state.renderer.setSize(width, height, false);
     state.renderer.render(state.scene, state.camera);
+    updateScaleBar(width);
     console.log("[terrain] rendered frame", { viewMode, width, height });
+  }
+
+  function updateScaleBar(width) {
+    const bar = document.getElementById("scale-bar");
+    if (!bar || !state.camera || !state.data) return;
+
+    const terrain = state.data.terrain;
+    const midHeight = (terrain.zMin + terrain.zMax) / 2;
+    const start = new THREE.Vector3(0, midHeight, 0).project(state.camera);
+    const end = new THREE.Vector3(1000, midHeight, 0).project(state.camera);
+    const pixels = Math.abs(end.x - start.x) * width / 2;
+    bar.style.width = `${Math.max(8, pixels)}px`;
+  }
+
+  function rebuildGeometry() {
+    if (!state.scene || !state.data) return;
+    if (state.root) {
+      state.scene.remove(state.root);
+    }
+    state.root = new THREE.Group();
+    state.scene.add(state.root);
+    buildTerrain(state.data);
+    buildOverlays(state.data);
+    setCamera(state.viewMode);
+    setStatus(`Cutout ${Math.round(viewRadius())} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`);
   }
 
   function render(data, viewMode) {
@@ -316,15 +436,16 @@
 
     resetScene(container);
     installDrag(container);
-    state.root = new THREE.Group();
-    state.scene.add(state.root);
     state.data = data;
     state.viewMode = viewMode;
+    state.focusIndex = 0;
+    state.maxCutoutRadius = data.circle.radius;
+    state.minCutoutRadius = Math.max(250, Math.min(700, data.circle.radius * 0.08));
+    state.cutoutRadius = Math.max(state.minCutoutRadius, data.circle.radius * 0.24);
     state.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10000, 50000);
+    installScrubber();
 
-    buildTerrain(data);
-    buildOverlays(data);
-    setCamera(viewMode);
+    rebuildGeometry();
     setStatus(viewMode === "isometric" ? "Isometric WebGL terrain" : "Top-down WebGL terrain");
   }
 

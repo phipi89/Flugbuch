@@ -52,12 +52,19 @@ def create_app() -> Flask:
                     #terrain-viewer canvas {{ display: block; width: 100%; height: 100%; }}
                     #terrain-status {{ position: fixed; top: 14px; left: 16px; z-index: 2; color: #e5e7eb; font-size: 13px; letter-spacing: .02em; }}
                     #flight-label {{ position: fixed; right: 16px; bottom: 14px; z-index: 2; color: #cbd5e1; font-size: 12px; }}
+                    #scrub {{ position: fixed; left: 16px; right: 16px; bottom: 18px; z-index: 3; accent-color: #f59e0b; }}
+                    #help {{ position: fixed; top: 14px; right: 16px; z-index: 2; color: #94a3b8; font-size: 12px; }}
+                    #scale {{ position: fixed; right: 16px; bottom: 48px; z-index: 3; color: #e5e7eb; font-size: 12px; text-align: center; text-shadow: 0 1px 2px #020617; }}
+                    #scale-bar {{ height: 4px; min-width: 8px; margin-bottom: 4px; border: 1px solid rgba(255,255,255,.9); border-top: 0; background: rgba(245,158,11,.85); }}
                 </style>
             </head>
             <body>
                 <div id="terrain-status">Loading renderer...</div>
+                <div id="help">drag left/right to rotate · wheel to zoom · scrub along flight</div>
                 <div id="terrain-viewer"></div>
                 <div id="flight-label">{flight_label}</div>
+                <div id="scale"><div id="scale-bar"></div><div>1 km</div></div>
+                <input id="scrub" type="range" min="0" max="0" value="0" step="1">
                 <script>window.TERRAIN_PAYLOAD = {payload_json}; window.TERRAIN_VIEW_MODE = "isometric";</script>
                 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
                 <script src="/assets/terrain_viewer.js"></script>
