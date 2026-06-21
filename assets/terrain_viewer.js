@@ -7,13 +7,21 @@
     camera: null,
     root: null,
     data: null,
+    meta: null,
+    overviewData: null,
     pendingRetry: null,
+    pendingRequest: null,
+    abortController: null,
+    requestSerial: 0,
+    terrainCache: new Map(),
+    tileCache: new Map(),
     azimuth: Math.PI / 4,
     dragging: false,
     dragStartX: 0,
     dragStartAzimuth: 0,
     viewMode: "isometric",
     dragInstalled: false,
+    scrubInstalled: false,
     focusIndex: 0,
     cutoutRadius: 1200,
     minCutoutRadius: 450,
@@ -21,6 +29,7 @@
   };
 
   const SHADE_LIGHT = new THREE.Vector3(-0.45, 0.72, -0.52).normalize();
+  const TILE_SIZE = 1000;
 
   function setStatus(message) {
     const status = document.getElementById("terrain-status");
@@ -64,12 +73,135 @@
   }
 
   function viewCenter() {
-    const point = state.data.flightPath[Math.min(state.focusIndex, state.data.flightPath.length - 1)];
-    return [point[0], point[1]];
+    return state.data.circle.center;
   }
 
   function viewRadius() {
     return Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius));
+  }
+
+  function clampedCenterFor(point, radius) {
+    const full = state.meta.fullCircle;
+    const fullCenter = full.center;
+    const maxDistance = Math.max(0, full.radius - radius);
+    const dx = point[0] - fullCenter[0];
+    const dy = point[1] - fullCenter[1];
+    const distance = Math.hypot(dx, dy);
+    if (distance <= maxDistance || distance === 0) return [point[0], point[1]];
+    return [fullCenter[0] + dx / distance * maxDistance, fullCenter[1] + dy / distance * maxDistance];
+  }
+
+  function overviewFor(index, radius) {
+    if (!state.overviewData || !state.meta) return null;
+    const point = state.meta.flightPath[Math.max(0, Math.min(state.meta.flightPath.length - 1, index))];
+    return {
+      ...state.overviewData,
+      circle: {
+        center: clampedCenterFor(point, radius),
+        radius,
+      },
+      fullCircle: state.meta.fullCircle,
+      flightPath: state.meta.flightPath,
+      focusIndex: index,
+      minRadius: state.minCutoutRadius,
+      maxRadius: state.maxCutoutRadius,
+      resolution: state.overviewData.resolution,
+      preview: true,
+    };
+  }
+
+  function resolutionForRadius(radius) {
+    if (radius >= 6000) return 25;
+    if (radius >= 3000) return 15;
+    return 5;
+  }
+
+  function tileKey(tile) {
+    return `${tile.resolution}:${tile.x0}:${tile.y0}`;
+  }
+
+  function tileIntersectsCircle(x0, y0, center, radius) {
+    const nearestX = Math.max(x0, Math.min(center[0], x0 + TILE_SIZE));
+    const nearestY = Math.max(y0, Math.min(center[1], y0 + TILE_SIZE));
+    const dx = nearestX - center[0];
+    const dy = nearestY - center[1];
+    return dx * dx + dy * dy <= radius * radius;
+  }
+
+  function neededTiles(center, radius, resolution) {
+    const tiles = [];
+    const minX = Math.floor((center[0] - radius) / TILE_SIZE) * TILE_SIZE;
+    const maxX = Math.floor((center[0] + radius) / TILE_SIZE) * TILE_SIZE;
+    const minY = Math.floor((center[1] - radius) / TILE_SIZE) * TILE_SIZE;
+    const maxY = Math.floor((center[1] + radius) / TILE_SIZE) * TILE_SIZE;
+    for (let x0 = minX; x0 <= maxX; x0 += TILE_SIZE) {
+      for (let y0 = minY; y0 <= maxY; y0 += TILE_SIZE) {
+        if (tileIntersectsCircle(x0, y0, center, radius)) {
+          tiles.push({ x0, y0, resolution });
+        }
+      }
+    }
+    return tiles;
+  }
+
+  function assembleTerrainFromTiles(tiles, circle, focusIndex, resolution) {
+    const tilePayloads = tiles.map((tile) => state.tileCache.get(tileKey(tile)).tile);
+    const minX = Math.min(...tilePayloads.map((tile) => tile.x0));
+    const minY = Math.min(...tilePayloads.map((tile) => tile.y0));
+    const maxX = Math.max(...tilePayloads.map((tile) => tile.x0 + tile.size));
+    const maxY = Math.max(...tilePayloads.map((tile) => tile.y0 + tile.size));
+    const width = Math.round((maxX - minX) / resolution) + 1;
+    const height = Math.round((maxY - minY) / resolution) + 1;
+    const z = new Array(width * height).fill(NaN);
+
+    for (const tile of tilePayloads) {
+      const xOffset = Math.round((tile.x0 - minX) / resolution);
+      const yOffset = Math.round((tile.y0 - minY) / resolution);
+      for (let y = 0; y < tile.height; y += 1) {
+        for (let x = 0; x < tile.width; x += 1) {
+          z[(yOffset + y) * width + xOffset + x] = tile.z[y * tile.width + x];
+        }
+      }
+    }
+
+    let zMin = Infinity;
+    let zMax = -Infinity;
+    let sum = 0;
+    let count = 0;
+    for (const value of z) {
+      if (!Number.isNaN(value)) {
+        zMin = Math.min(zMin, value);
+        zMax = Math.max(zMax, value);
+        sum += value;
+        count += 1;
+      }
+    }
+    const fill = count ? sum / count : 0;
+    for (let i = 0; i < z.length; i += 1) {
+      if (Number.isNaN(z[i])) z[i] = fill;
+    }
+
+    return {
+      terrain: {
+        x0: minX,
+        y0: minY,
+        dx: resolution,
+        dy: resolution,
+        width,
+        height,
+        z,
+        zMin,
+        zMax,
+      },
+      circle,
+      fullCircle: state.meta.fullCircle,
+      flightPath: state.meta.flightPath,
+      sun: state.meta.sun,
+      focusIndex,
+      resolution,
+      minRadius: state.minCutoutRadius,
+      maxRadius: state.maxCutoutRadius,
+    };
   }
 
   function sampleHeight(terrain, x, y) {
@@ -139,18 +271,21 @@
       event.preventDefault();
       const factor = Math.exp(event.deltaY * 0.0012);
       state.cutoutRadius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius * factor));
-      rebuildGeometry();
+      requestTerrain();
     }, { passive: false });
   }
 
   function installScrubber() {
+    if (state.scrubInstalled) return;
     const scrubber = document.getElementById("scrub");
-    if (!scrubber || !state.data) return;
-    scrubber.max = String(Math.max(0, state.data.flightPath.length - 1));
+    const path = state.meta?.flightPath || state.data?.flightPath;
+    if (!scrubber || !path) return;
+    state.scrubInstalled = true;
+    scrubber.max = String(Math.max(0, path.length - 1));
     scrubber.value = String(state.focusIndex);
     scrubber.addEventListener("input", () => {
       state.focusIndex = Number(scrubber.value);
-      rebuildGeometry();
+      requestTerrain();
     });
   }
 
@@ -393,6 +528,7 @@
 
   function rebuildGeometry() {
     if (!state.scene || !state.data) return;
+    const start = performance.now();
     if (state.root) {
       state.scene.remove(state.root);
     }
@@ -401,7 +537,88 @@
     buildTerrain(state.data);
     buildOverlays(state.data);
     setCamera(state.viewMode);
-    setStatus(`Cutout ${Math.round(viewRadius())} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`);
+    const label = state.data.preview ? "Preview" : "Cutout";
+    setStatus(`${label} ${Math.round(viewRadius())} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`);
+    console.log("[terrain] rebuild geometry timing", {
+      preview: !!state.data.preview,
+      totalMs: Math.round(performance.now() - start),
+      grid: `${state.data.terrain.width}x${state.data.terrain.height}`,
+      radius: Math.round(state.data.circle.radius),
+      resolution: state.data.resolution,
+    });
+  }
+
+  function requestTerrain() {
+    if (!state.meta) return;
+    const radius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius));
+    const index = Math.max(0, Math.min(state.meta.flightPath.length - 1, state.focusIndex));
+    const focusPoint = state.meta.flightPath[index];
+    const center = clampedCenterFor(focusPoint, radius);
+    const circle = { center, radius };
+    const resolution = resolutionForRadius(radius);
+    const tiles = neededTiles(center, radius, resolution);
+    const missingTiles = tiles.filter((tile) => !state.tileCache.has(tileKey(tile)));
+    const serial = ++state.requestSerial;
+    if (state.abortController) {
+      state.abortController.abort();
+      state.abortController = null;
+    }
+
+    if (missingTiles.length === 0) {
+      window.clearTimeout(state.pendingRequest);
+      render(assembleTerrainFromTiles(tiles, circle, index, resolution), state.viewMode);
+      return;
+    }
+
+    const preview = overviewFor(index, radius);
+    if (preview) {
+      render(preview, state.viewMode);
+      setStatus(`Preview ${Math.round(radius * 2 / 1000)} km terrain...`);
+    }
+
+    window.clearTimeout(state.pendingRequest);
+    state.pendingRequest = window.setTimeout(async () => {
+      if (serial !== state.requestSerial) return;
+
+      setStatus(`Loading ${missingTiles.length}/${tiles.length} terrain tiles...`);
+      state.abortController = new AbortController();
+      const fetchStart = performance.now();
+      let tileResponses;
+      try {
+        tileResponses = await Promise.all(missingTiles.map(async (tile) => {
+          const response = await fetch(
+            `/terrain-tile?x0=${tile.x0}&y0=${tile.y0}&resolution=${tile.resolution}`,
+            { signal: state.abortController.signal }
+          );
+          if (!response.ok) throw new Error(`tile ${tileKey(tile)} failed: ${response.status}`);
+          const jsonStart = performance.now();
+          const payload = await response.json();
+          return { tile, payload, jsonMs: performance.now() - jsonStart };
+        }));
+      } catch (error) {
+        if (error.name !== "AbortError") {
+          setStatus(`Terrain request failed: ${error.message}`);
+        }
+        return;
+      }
+      const responseMs = performance.now() - fetchStart;
+      if (serial !== state.requestSerial) return;
+      for (const { tile, payload } of tileResponses) {
+        state.tileCache.set(tileKey(tile), payload);
+      }
+      const data = assembleTerrainFromTiles(tiles, circle, index, resolution);
+      const renderStart = performance.now();
+      render(data, state.viewMode);
+      console.log("[terrain] tile request timing", {
+        responseMs: Math.round(responseMs),
+        jsonMs: Math.round(tileResponses.reduce((total, item) => total + item.jsonMs, 0)),
+        renderMs: Math.round(performance.now() - renderStart),
+        missingTiles: missingTiles.length,
+        totalTiles: tiles.length,
+        grid: `${data.terrain.width}x${data.terrain.height}`,
+        resolution: data.resolution,
+      });
+    }, 180);
   }
 
   function render(data, viewMode) {
@@ -438,10 +655,10 @@
     installDrag(container);
     state.data = data;
     state.viewMode = viewMode;
-    state.focusIndex = 0;
-    state.maxCutoutRadius = data.circle.radius;
-    state.minCutoutRadius = Math.max(250, Math.min(700, data.circle.radius * 0.08));
-    state.cutoutRadius = Math.max(state.minCutoutRadius, data.circle.radius * 0.24);
+    state.focusIndex = data.focusIndex ?? state.focusIndex;
+    state.maxCutoutRadius = data.maxRadius ?? state.maxCutoutRadius;
+    state.minCutoutRadius = data.minRadius ?? state.minCutoutRadius;
+    state.cutoutRadius = data.circle.radius;
     state.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10000, 50000);
     installScrubber();
 
@@ -452,10 +669,17 @@
   window.renderTerrainViewer = render;
   window.addEventListener("resize", () => setCamera(state.viewMode));
   window.addEventListener("DOMContentLoaded", () => {
-    if (window.TERRAIN_PAYLOAD) {
-      render(window.TERRAIN_PAYLOAD, window.TERRAIN_VIEW_MODE || "isometric");
+    if (window.TERRAIN_META) {
+      state.meta = window.TERRAIN_META;
+      state.overviewData = window.TERRAIN_OVERVIEW || null;
+      state.viewMode = window.TERRAIN_VIEW_MODE || "isometric";
+      state.minCutoutRadius = state.meta.minRadius;
+      state.maxCutoutRadius = state.meta.maxRadius;
+      state.cutoutRadius = state.maxCutoutRadius;
+      installScrubber();
+      requestTerrain();
     } else {
-      setStatus("No embedded terrain payload");
+      setStatus("No embedded terrain metadata");
     }
   });
 })();
