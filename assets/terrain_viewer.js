@@ -15,6 +15,7 @@
     requestSerial: 0,
     terrainCache: new Map(),
     tileCache: new Map(),
+    pendingTileRequests: new Map(),
     azimuth: Math.PI / 4,
     dragging: false,
     dragStartX: 0,
@@ -23,13 +24,11 @@
     dragInstalled: false,
     scrubInstalled: false,
     focusIndex: 0,
+    directionalLight: null,
     cutoutRadius: 1200,
     minCutoutRadius: 450,
     maxCutoutRadius: 1200,
   };
-
-  const SHADE_LIGHT = new THREE.Vector3(-0.45, 0.72, -0.52).normalize();
-  const TILE_SIZE = 1000;
 
   function setStatus(message) {
     const status = document.getElementById("terrain-status");
@@ -39,29 +38,6 @@
 
   function mapAngleFromAzimuth(azimuth) {
     return -(azimuth + Math.PI / 2);
-  }
-
-  function colorForNormal(normal) {
-    const exposure = Math.max(0, normal.dot(SHADE_LIGHT));
-    const shade = 0.26 + exposure * 0.74;
-    return new THREE.Color(0x8ca071).multiplyScalar(shade);
-  }
-
-  function terrainNormalAt(terrain, ix, iy) {
-    const x0 = Math.max(0, ix - 1);
-    const x1 = Math.min(terrain.width - 1, ix + 1);
-    const y0 = Math.max(0, iy - 1);
-    const y1 = Math.min(terrain.height - 1, iy + 1);
-    const dzdx = (terrain.z[iy * terrain.width + x1] - terrain.z[iy * terrain.width + x0]) / Math.max(terrain.dx, (x1 - x0) * terrain.dx);
-    const dzdy = (terrain.z[y1 * terrain.width + ix] - terrain.z[y0 * terrain.width + ix]) / Math.max(terrain.dy, (y1 - y0) * terrain.dy);
-    return new THREE.Vector3(-dzdx, 1, dzdy).normalize();
-  }
-
-  function terrainNormalAtPoint(terrain, x, y) {
-    const step = Math.max(terrain.dx, terrain.dy);
-    const dzdx = (sampleHeight(terrain, x + step, y) - sampleHeight(terrain, x - step, y)) / (2 * step);
-    const dzdy = (sampleHeight(terrain, x, y + step) - sampleHeight(terrain, x, y - step)) / (2 * step);
-    return new THREE.Vector3(-dzdx, 1, dzdy).normalize();
   }
 
   function localX(x, center) {
@@ -110,34 +86,36 @@
     };
   }
 
-  function resolutionForRadius(radius) {
-    if (radius >= 6000) return 25;
-    if (radius >= 3000) return 15;
-    return 5;
+  function lodForRadius(radius) {
+    if (radius >= 10000) return { tileSize: 10000, resolution: 50 };
+    if (radius >= 5000) return { tileSize: 5000, resolution: 25 };
+    if (radius >= 2500) return { tileSize: 2000, resolution: 10 };
+    return { tileSize: 1000, resolution: 5 };
   }
 
   function tileKey(tile) {
-    return `${tile.resolution}:${tile.x0}:${tile.y0}`;
+    return `${tile.resolution}:${tile.size}:${tile.x0}:${tile.y0}`;
   }
 
-  function tileIntersectsCircle(x0, y0, center, radius) {
-    const nearestX = Math.max(x0, Math.min(center[0], x0 + TILE_SIZE));
-    const nearestY = Math.max(y0, Math.min(center[1], y0 + TILE_SIZE));
+  function tileIntersectsCircle(x0, y0, size, center, radius) {
+    const nearestX = Math.max(x0, Math.min(center[0], x0 + size));
+    const nearestY = Math.max(y0, Math.min(center[1], y0 + size));
     const dx = nearestX - center[0];
     const dy = nearestY - center[1];
     return dx * dx + dy * dy <= radius * radius;
   }
 
-  function neededTiles(center, radius, resolution) {
+  function neededTiles(center, radius, lod) {
     const tiles = [];
-    const minX = Math.floor((center[0] - radius) / TILE_SIZE) * TILE_SIZE;
-    const maxX = Math.floor((center[0] + radius) / TILE_SIZE) * TILE_SIZE;
-    const minY = Math.floor((center[1] - radius) / TILE_SIZE) * TILE_SIZE;
-    const maxY = Math.floor((center[1] + radius) / TILE_SIZE) * TILE_SIZE;
-    for (let x0 = minX; x0 <= maxX; x0 += TILE_SIZE) {
-      for (let y0 = minY; y0 <= maxY; y0 += TILE_SIZE) {
-        if (tileIntersectsCircle(x0, y0, center, radius)) {
-          tiles.push({ x0, y0, resolution });
+    const size = lod.tileSize;
+    const minX = Math.floor((center[0] - radius) / size) * size;
+    const maxX = Math.floor((center[0] + radius) / size) * size;
+    const minY = Math.floor((center[1] - radius) / size) * size;
+    const maxY = Math.floor((center[1] + radius) / size) * size;
+    for (let x0 = minX; x0 <= maxX; x0 += size) {
+      for (let y0 = minY; y0 <= maxY; y0 += size) {
+        if (tileIntersectsCircle(x0, y0, size, center, radius)) {
+          tiles.push({ x0, y0, size, resolution: lod.resolution });
         }
       }
     }
@@ -148,10 +126,10 @@
     const tilePayloads = tiles.map((tile) => state.tileCache.get(tileKey(tile)).tile);
     const minX = Math.min(...tilePayloads.map((tile) => tile.x0));
     const minY = Math.min(...tilePayloads.map((tile) => tile.y0));
-    const maxX = Math.max(...tilePayloads.map((tile) => tile.x0 + tile.size));
-    const maxY = Math.max(...tilePayloads.map((tile) => tile.y0 + tile.size));
-    const width = Math.round((maxX - minX) / resolution) + 1;
-    const height = Math.round((maxY - minY) / resolution) + 1;
+    const maxX = Math.max(...tilePayloads.map((tile) => tile.x0 + tile.resolution * tile.width));
+    const maxY = Math.max(...tilePayloads.map((tile) => tile.y0 + tile.resolution * tile.height));
+    const width = Math.round((maxX - minX) / resolution);
+    const height = Math.round((maxY - minY) / resolution);
     const z = new Array(width * height).fill(NaN);
 
     for (const tile of tilePayloads) {
@@ -204,6 +182,31 @@
     };
   }
 
+  function ensureTile(tile) {
+    const key = tileKey(tile);
+    if (state.tileCache.has(key)) {
+      return Promise.resolve({ tile, payload: state.tileCache.get(key), cached: true, jsonMs: 0 });
+    }
+    if (state.pendingTileRequests.has(key)) {
+      return state.pendingTileRequests.get(key);
+    }
+
+    const promise = (async () => {
+      const response = await fetch(`/terrain-tile?x0=${tile.x0}&y0=${tile.y0}&resolution=${tile.resolution}&size=${tile.size}`);
+      if (!response.ok) throw new Error(`tile ${key} failed: ${response.status}`);
+      const jsonStart = performance.now();
+      const payload = await response.json();
+      const jsonMs = performance.now() - jsonStart;
+      state.tileCache.set(key, payload);
+      return { tile, payload, cached: false, jsonMs };
+    })().finally(() => {
+      state.pendingTileRequests.delete(key);
+    });
+
+    state.pendingTileRequests.set(key, promise);
+    return promise;
+  }
+
   function sampleHeight(terrain, x, y) {
     const gx = Math.max(0, Math.min(terrain.width - 1, (x - terrain.x0) / terrain.dx));
     const gy = Math.max(0, Math.min(terrain.height - 1, (y - terrain.y0) / terrain.dy));
@@ -220,6 +223,14 @@
     return z00 * (1 - tx) * (1 - ty) + z10 * tx * (1 - ty) + z01 * (1 - tx) * ty + z11 * tx * ty;
   }
 
+  function meshStride(terrain, radius) {
+    const estimatedVertices = Math.PI * radius * radius / Math.max(1, terrain.dx * terrain.dy);
+    if (estimatedVertices > 600000) return 4;
+    if (estimatedVertices > 300000) return 3;
+    if (estimatedVertices > 120000) return 2;
+    return 1;
+  }
+
   function resetScene(container) {
     console.log("[terrain] reset scene", { width: container.clientWidth, height: container.clientHeight });
     if (state.renderer) {
@@ -233,10 +244,10 @@
     state.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     container.appendChild(state.renderer.domElement);
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.74);
-    const directional = new THREE.DirectionalLight(0xfff1c2, 1.4);
-    directional.position.set(-0.7, 0.45, 1.0);
-    state.scene.add(ambient, directional);
+    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    state.directionalLight = new THREE.DirectionalLight(0xfff1c2, 1.6);
+    state.directionalLight.position.set(-0.7, 0.45, 1.0);
+    state.scene.add(ambient, state.directionalLight);
   }
 
   function installDrag(container) {
@@ -285,6 +296,7 @@
     scrubber.value = String(state.focusIndex);
     scrubber.addEventListener("input", () => {
       state.focusIndex = Number(scrubber.value);
+      updateSunLight(state.focusIndex);
       requestTerrain();
     });
   }
@@ -295,33 +307,35 @@
     const center = viewCenter();
     const radius = viewRadius();
     const baseHeight = terrain.zMin - Math.max(100, (terrain.zMax - terrain.zMin) * 0.14);
+    const stride = meshStride(terrain, radius);
     const positions = [];
-    const colors = [];
-    const indexByGrid = new Int32Array(terrain.width * terrain.height).fill(-1);
+    const sampledWidth = Math.ceil(terrain.width / stride);
+    const sampledHeight = Math.ceil(terrain.height / stride);
+    const indexByGrid = new Int32Array(sampledWidth * sampledHeight).fill(-1);
 
-    for (let iy = 0; iy < terrain.height; iy += 1) {
+    for (let iy = 0; iy < terrain.height; iy += stride) {
       const y = terrain.y0 + iy * terrain.dy;
-      for (let ix = 0; ix < terrain.width; ix += 1) {
+      const sy = Math.floor(iy / stride);
+      for (let ix = 0; ix < terrain.width; ix += stride) {
         const x = terrain.x0 + ix * terrain.dx;
         const dx = x - center[0];
         const dy = y - center[1];
         if (dx * dx + dy * dy > radius * radius) continue;
 
         const z = terrain.z[iy * terrain.width + ix];
-        indexByGrid[iy * terrain.width + ix] = positions.length / 3;
+        const sx = Math.floor(ix / stride);
+        indexByGrid[sy * sampledWidth + sx] = positions.length / 3;
         positions.push(localX(x, center), z, localY(y, center));
-        const color = colorForNormal(terrainNormalAt(terrain, ix, iy));
-        colors.push(color.r, color.g, color.b);
       }
     }
 
     const indices = [];
-    for (let iy = 0; iy < terrain.height - 1; iy += 1) {
-      for (let ix = 0; ix < terrain.width - 1; ix += 1) {
-        const a = indexByGrid[iy * terrain.width + ix];
-        const b = indexByGrid[iy * terrain.width + ix + 1];
-        const c = indexByGrid[(iy + 1) * terrain.width + ix];
-        const d = indexByGrid[(iy + 1) * terrain.width + ix + 1];
+    for (let sy = 0; sy < sampledHeight - 1; sy += 1) {
+      for (let sx = 0; sx < sampledWidth - 1; sx += 1) {
+        const a = indexByGrid[sy * sampledWidth + sx];
+        const b = indexByGrid[sy * sampledWidth + sx + 1];
+        const c = indexByGrid[(sy + 1) * sampledWidth + sx];
+        const d = indexByGrid[(sy + 1) * sampledWidth + sx + 1];
         if (a >= 0 && b >= 0 && c >= 0) indices.push(a, c, b);
         if (b >= 0 && c >= 0 && d >= 0) indices.push(b, c, d);
       }
@@ -329,17 +343,16 @@
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const material = new THREE.MeshLambertMaterial({ color: 0xc8c0b0, side: THREE.DoubleSide });
     state.root.add(new THREE.Mesh(geometry, material));
 
     buildEdgeFill(data);
     buildCylinderWall(data, baseHeight);
     console.timeEnd("[terrain] build terrain mesh");
-    console.log("[terrain] terrain mesh ready", { vertices: positions.length / 3, triangles: indices.length / 3 });
+    console.log("[terrain] terrain mesh ready", { vertices: positions.length / 3, triangles: indices.length / 3, stride });
   }
 
   function buildEdgeFill(data) {
@@ -350,7 +363,6 @@
     const innerRadius = Math.max(1, radius - Math.max(terrain.dx, terrain.dy) * 2.2);
     const segments = 256;
     const positions = [];
-    const colors = [];
     const indices = [];
 
     for (let i = 0; i <= segments; i += 1) {
@@ -360,8 +372,6 @@
         const y = center[1] + Math.sin(angle) * r;
         const z = sampleHeight(terrain, x, y);
         positions.push(localX(x, center), z + 1, localY(y, center));
-        const color = colorForNormal(terrainNormalAtPoint(terrain, x, y));
-        colors.push(color.r, color.g, color.b);
       }
     }
 
@@ -375,10 +385,9 @@
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-    const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const material = new THREE.MeshLambertMaterial({ color: 0xc8c0b0, side: THREE.DoubleSide });
     state.root.add(new THREE.Mesh(geometry, material));
     console.timeEnd("[terrain] build edge fill");
   }
@@ -477,6 +486,15 @@
     console.timeEnd("[terrain] build overlays");
   }
 
+  function updateSunLight(index) {
+    if (!state.directionalLight) return;
+    const directions = state.meta?.sunDirections;
+    const mean = state.meta?.meanSunDirection;
+    const dir = (directions && directions[index]) || mean;
+    if (!dir) return;
+    state.directionalLight.position.set(dir[0], dir[2], -dir[1]);
+  }
+
   function setCamera(viewMode) {
     const container = document.getElementById("terrain-viewer");
     if (!container || !state.camera || !state.renderer || !state.data) return;
@@ -555,68 +573,72 @@
     const focusPoint = state.meta.flightPath[index];
     const center = clampedCenterFor(focusPoint, radius);
     const circle = { center, radius };
-    const resolution = resolutionForRadius(radius);
-    const tiles = neededTiles(center, radius, resolution);
+    const lod = lodForRadius(radius);
+    const resolution = lod.resolution;
+    const tiles = neededTiles(center, radius, lod);
     const missingTiles = tiles.filter((tile) => !state.tileCache.has(tileKey(tile)));
     const serial = ++state.requestSerial;
-    if (state.abortController) {
-      state.abortController.abort();
-      state.abortController = null;
-    }
+    const renderAvailableTiles = (previewAllowed = true) => {
+      const availableTiles = tiles.filter((tile) => state.tileCache.has(tileKey(tile)));
+      if (availableTiles.length > 0) {
+        render(assembleTerrainFromTiles(availableTiles, circle, index, resolution), state.viewMode);
+        setStatus(`Tiles ${availableTiles.length}/${tiles.length} · ${lod.tileSize / 1000} km @ ${resolution} m · point ${index + 1}/${state.meta.flightPath.length}`);
+        return true;
+      }
+      if (previewAllowed) {
+        const preview = overviewFor(index, radius);
+        if (preview) {
+          render(preview, state.viewMode);
+          setStatus(`Preview while loading ${tiles.length} terrain tiles...`);
+          return true;
+        }
+      }
+      return false;
+    };
 
     if (missingTiles.length === 0) {
       window.clearTimeout(state.pendingRequest);
-      render(assembleTerrainFromTiles(tiles, circle, index, resolution), state.viewMode);
+      renderAvailableTiles(false);
       return;
     }
 
-    const preview = overviewFor(index, radius);
-    if (preview) {
-      render(preview, state.viewMode);
-      setStatus(`Preview ${Math.round(radius * 2 / 1000)} km terrain...`);
-    }
+    renderAvailableTiles(true);
 
     window.clearTimeout(state.pendingRequest);
     state.pendingRequest = window.setTimeout(async () => {
       if (serial !== state.requestSerial) return;
 
-      setStatus(`Loading ${missingTiles.length}/${tiles.length} terrain tiles...`);
-      state.abortController = new AbortController();
+      setStatus(`Loading ${missingTiles.length}/${tiles.length} terrain tiles (${lod.tileSize / 1000} km @ ${resolution} m)...`);
       const fetchStart = performance.now();
-      let tileResponses;
-      try {
-        tileResponses = await Promise.all(missingTiles.map(async (tile) => {
-          const response = await fetch(
-            `/terrain-tile?x0=${tile.x0}&y0=${tile.y0}&resolution=${tile.resolution}`,
-            { signal: state.abortController.signal }
-          );
-          if (!response.ok) throw new Error(`tile ${tileKey(tile)} failed: ${response.status}`);
-          const jsonStart = performance.now();
-          const payload = await response.json();
-          return { tile, payload, jsonMs: performance.now() - jsonStart };
-        }));
-      } catch (error) {
-        if (error.name !== "AbortError") {
-          setStatus(`Terrain request failed: ${error.message}`);
-        }
-        return;
+      let completedTiles = 0;
+      for (const tile of missingTiles) {
+        ensureTile(tile)
+          .then(({ cached, jsonMs }) => {
+            completedTiles += 1;
+            if (serial !== state.requestSerial) return;
+            const renderStart = performance.now();
+            renderAvailableTiles(false);
+            console.log("[terrain] tile arrived", {
+              tile: tileKey(tile),
+              cached,
+              jsonMs: Math.round(jsonMs),
+              completedTiles,
+              missingTiles: missingTiles.length,
+              elapsedMs: Math.round(performance.now() - fetchStart),
+              renderMs: Math.round(performance.now() - renderStart),
+            });
+          })
+          .catch((error) => {
+            if (serial === state.requestSerial) {
+              setStatus(`Terrain tile failed: ${error.message}`);
+            }
+          });
       }
-      const responseMs = performance.now() - fetchStart;
-      if (serial !== state.requestSerial) return;
-      for (const { tile, payload } of tileResponses) {
-        state.tileCache.set(tileKey(tile), payload);
-      }
-      const data = assembleTerrainFromTiles(tiles, circle, index, resolution);
-      const renderStart = performance.now();
-      render(data, state.viewMode);
-      console.log("[terrain] tile request timing", {
-        responseMs: Math.round(responseMs),
-        jsonMs: Math.round(tileResponses.reduce((total, item) => total + item.jsonMs, 0)),
-        renderMs: Math.round(performance.now() - renderStart),
+      console.log("[terrain] tile requests started", {
         missingTiles: missingTiles.length,
         totalTiles: tiles.length,
-        grid: `${data.terrain.width}x${data.terrain.height}`,
-        resolution: data.resolution,
+        tileSize: lod.tileSize,
+        resolution,
       });
     }, 180);
   }
@@ -662,6 +684,7 @@
     state.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10000, 50000);
     installScrubber();
 
+    updateSunLight(state.focusIndex);
     rebuildGeometry();
     setStatus(viewMode === "isometric" ? "Isometric WebGL terrain" : "Top-down WebGL terrain");
   }

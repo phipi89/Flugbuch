@@ -16,6 +16,7 @@ from scipy.interpolate import RectBivariateSpline
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SWISSALTI3D_INDEX = PROJECT_ROOT / "src" / "swisstopo" / "swissalti3d.csv"
 CACHE_DIR = PROJECT_ROOT / "cache" / "alti3d"
+WEBGL_TILE_CACHE_DIR = PROJECT_ROOT / "cache" / "webgl_tiles"
 WEBGL_TILE_SIZE_M = 1000
 
 
@@ -184,16 +185,30 @@ def webgl_tile_payload(tile_x0: float, tile_y0: float, resolution_m: float, tile
     x0 = float(tile_x0)
     y0 = float(tile_y0)
     resolution = float(resolution_m)
-    x = np.arange(x0, x0 + tile_size_m + resolution, resolution)
-    y = np.arange(y0, y0 + tile_size_m + resolution, resolution)
-    xx, yy = np.meshgrid(x, y, indexing="xy")
+    tile_points = int(round(tile_size_m / resolution))
+    x = x0 + np.arange(tile_points) * resolution
+    y = y0 + np.arange(tile_points) * resolution
+    cache_key = f"s{tile_size_m}_r{resolution:g}_x{int(x0)}_y{int(y0)}.npy"
+    cached_path = WEBGL_TILE_CACHE_DIR / cache_key
 
-    sample_start = perf_counter()
-    z = sample_points(xx, yy)
-    sample_ms = (perf_counter() - sample_start) * 1000
+    cache_start = perf_counter()
+    try:
+        z = np.load(cached_path)
+        cache_ms = (perf_counter() - cache_start) * 1000
+        sample_ms = 0.0
+        source = "disk"
+    except FileNotFoundError:
+        WEBGL_TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        xx, yy = np.meshgrid(x, y, indexing="xy")
+        sample_start = perf_counter()
+        z = sample_points(xx, yy).astype(np.float32)
+        sample_ms = (perf_counter() - sample_start) * 1000
+        np.save(cached_path, z)
+        cache_ms = (perf_counter() - cache_start) * 1000 - sample_ms
+        source = "sampled"
     total_ms = (perf_counter() - start) * 1000
     print(
-        f"[terrain] tile_payload x0={x0:.0f} y0={y0:.0f} resolution={resolution:.0f}m grid={len(x)}x{len(y)} sample={sample_ms:.0f} ms total={total_ms:.0f} ms",
+        f"[terrain] tile_payload x0={x0:.0f} y0={y0:.0f} resolution={resolution:.0f}m grid={len(x)}x{len(y)} source={source} cache={cache_ms:.0f} ms sample={sample_ms:.0f} ms total={total_ms:.0f} ms",
         flush=True,
     )
 

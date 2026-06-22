@@ -17,7 +17,7 @@ def test_flight():
     if len(paths) == 0:
         raise ValueError("Need at least one valid flight for the WebGL test page.")
 
-    path = paths[-1]
+    path = paths[-2]
     print(f"[terrain] test flight {path}", flush=True)
     flight = load_flight(path)
     return flight, path.relative_to(PROJECT_ROOT).as_posix()
@@ -44,6 +44,8 @@ def flight_metadata() -> tuple[dict, dict, str]:
             "startAzimuth": float(flight.sun_azimuth[0]),
             "endAzimuth": float(flight.sun_azimuth[-1]),
         },
+        "sunDirections": flight.sun_direction.astype(float).tolist(),
+        "meanSunDirection": flight.mean_sun_direction.astype(float).tolist(),
         "fullCircle": {
             "center": center.astype(float).tolist(),
             "radius": radius,
@@ -90,8 +92,9 @@ def create_app() -> Flask:
         x0 = float(request.args["x0"])
         y0 = float(request.args["y0"])
         resolution = float(request.args.get("resolution", 5))
+        size = int(request.args.get("size", 1000))
         payload_start = perf_counter()
-        payload = webgl_tile_payload(x0, y0, resolution)
+        payload = webgl_tile_payload(x0, y0, resolution, tile_size_m=size)
         payload_ms = (perf_counter() - payload_start) * 1000
         json_start = perf_counter()
         response = jsonify(payload)
