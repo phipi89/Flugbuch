@@ -51,7 +51,8 @@
   }
 
   function viewCenter() {
-    return state.data.circle.center;
+    const point = state.data.flightPath[Math.min(state.focusIndex, state.data.flightPath.length - 1)];
+    return clampedCenterFor(point, viewRadius());
   }
 
   function viewRadius() {
@@ -292,7 +293,7 @@
       event.preventDefault();
       const factor = Math.exp(event.deltaY * 0.0012);
       state.cutoutRadius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius * factor));
-      if (state.data) setCamera(state.viewMode);
+      if (state.data) rebuildGeometry();
       clearTimeout(wheelTimeout);
       wheelTimeout = setTimeout(() => requestTerrain(), 120);
     }, { passive: false });
@@ -309,6 +310,7 @@
     scrubber.addEventListener("input", () => {
       state.focusIndex = Number(scrubber.value);
       updateSunLight(state.focusIndex);
+      if (state.data) rebuildGeometry();
       requestTerrain();
     });
   }
@@ -463,32 +465,43 @@
     mesh.receiveShadow = true;
     state.root.add(mesh);
 
-    // Strongly blurred shadow disc under cylinder (multiple concentric rings)
-    for (let i = 0; i < 6; i++) {
-      const inner = radius * (0.85 + i * 0.05);
-      const outer = radius * (1.15 - i * 0.05);
-      const opacity = 0.08 * (1 - i / 6);
-      const ringGeo = new THREE.RingGeometry(inner, outer, 64);
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: 0x000000,
-        opacity,
-        transparent: true,
-        side: THREE.DoubleSide,
-        depthWrite: false
-      });
-      const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.rotation.x = -Math.PI / 2;
-      ring.position.set(0, baseHeight + 0.5, 0);
-      ring.receiveShadow = true;
-      state.root.add(ring);
-    }
+    // Soft blurred shadow disc under cylinder (canvas radial gradient)
+    const shadowSize = 512;
+    const shadowCanvas = document.createElement("canvas");
+    shadowCanvas.width = shadowSize;
+    shadowCanvas.height = shadowSize;
+    const shadowCtx = shadowCanvas.getContext("2d");
+    const grad = shadowCtx.createRadialGradient(shadowSize / 2, shadowSize / 2, 0, shadowSize / 2, shadowSize / 2, shadowSize / 2);
+    grad.addColorStop(0, "rgba(0,0,0,0.22)");
+    grad.addColorStop(0.35, "rgba(0,0,0,0.14)");
+    grad.addColorStop(0.65, "rgba(0,0,0,0.05)");
+    grad.addColorStop(1, "rgba(0,0,0,0)");
+    shadowCtx.fillStyle = grad;
+    shadowCtx.fillRect(0, 0, shadowSize, shadowSize);
+    const shadowTexture = new THREE.CanvasTexture(shadowCanvas);
+    const shadowGeo = new THREE.PlaneGeometry(radius * 2 * 0.92, radius * 2 * 0.92);
+    const shadowMat = new THREE.MeshBasicMaterial({
+      map: shadowTexture,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
+    shadowMesh.rotation.x = -Math.PI / 2;
+    shadowMesh.position.set(0, baseHeight - 2, 0);
+    state.root.add(shadowMesh);
 
     console.timeEnd("[terrain] build cylinder wall");
   }
 
-  function buildLine(points, color, width) {
+  function buildLine(points, color, width, opacity) {
+    const material = new THREE.LineBasicMaterial({ color, linewidth: width });
+    if (opacity !== undefined) {
+      material.transparent = true;
+      material.opacity = opacity;
+    }
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    return new THREE.Line(geometry, new THREE.LineBasicMaterial({ color, linewidth: width }));
+    return new THREE.Line(geometry, material);
   }
 
   function buildOverlays(data) {
@@ -498,14 +511,26 @@
     const circleRadius = viewRadius();
     const topLift = 26;
 
-    const pathPoints = data.flightPath
-      .filter((point) => {
-        const dx = point[0] - center[0];
-        const dy = point[1] - center[1];
-        return dx * dx + dy * dy <= circleRadius * circleRadius * 1.8;
-      })
-      .map((point) => new THREE.Vector3(localX(point[0], center), point[2] + topLift, localY(point[1], center)));
-    state.root.add(buildLine(pathPoints, 0xffffff, 3));
+    // Flight path: split into segments inside cylinder, dark with 67% opacity
+    const pathSegments = [];
+    let currentSegment = [];
+    for (const point of data.flightPath) {
+      const dx = point[0] - center[0];
+      const dy = point[1] - center[1];
+      if (dx * dx + dy * dy <= circleRadius * circleRadius) {
+        currentSegment.push(new THREE.Vector3(localX(point[0], center), point[2] + topLift, localY(point[1], center)));
+      } else {
+        if (currentSegment.length > 1) pathSegments.push(currentSegment);
+        currentSegment = [];
+      }
+    }
+    if (currentSegment.length > 1) pathSegments.push(currentSegment);
+    for (const seg of pathSegments) {
+      if (seg.length < 2) continue;
+      const curve = new THREE.CatmullRomCurve3(seg);
+      const tubeGeo = new THREE.TubeGeometry(curve, seg.length * 2, Math.max(1.2, circleRadius * 0.003), 6, false);
+      state.root.add(new THREE.Mesh(tubeGeo, new THREE.MeshBasicMaterial({ color: 0x222222, transparent: true, opacity: 0.6 })));
+    }
 
     const focusPoint = data.flightPath[Math.min(state.focusIndex, data.flightPath.length - 1)];
     const marker = new THREE.Mesh(
@@ -538,7 +563,9 @@
       const y = -Math.sin(angle) * arcRadius;
       arc.push(new THREE.Vector3(x, arcHeight, y));
     }
-    state.root.add(buildLine(arc, 0xf59e0b, 5));
+    const arcCurve = new THREE.CatmullRomCurve3(arc);
+    const arcGeo = new THREE.TubeGeometry(arcCurve, 80, Math.max(2.5, circleRadius * 0.008), 6, false);
+    state.root.add(new THREE.Mesh(arcGeo, new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.5 })));
     console.timeEnd("[terrain] build overlays");
   }
 
@@ -604,14 +631,11 @@
 
   function updateScaleBar(width) {
     const bar = document.getElementById("scale-bar");
-    if (!bar || !state.camera || !state.data) return;
+    if (!bar || !state.camera) return;
 
-    const terrain = state.data.terrain;
-    const midHeight = (terrain.zMin + terrain.zMax) / 2;
-    const start = new THREE.Vector3(0, midHeight, 0).project(state.camera);
-    const end = new THREE.Vector3(1000, midHeight, 0).project(state.camera);
-    const pixels = Math.abs(end.x - start.x) * width / 2;
-    bar.style.width = `${Math.max(8, pixels)}px`;
+    const frustumWidth = state.camera.right - state.camera.left;
+    const pixels = 1000 / frustumWidth * width;
+    bar.style.width = `${Math.max(8, Math.round(pixels))}px`;
   }
 
   function rebuildGeometry() {
@@ -650,72 +674,38 @@
     const tiles = neededTiles(center, radius, lod);
     const missingTiles = tiles.filter((tile) => !state.tileCache.has(tileKey(tile)));
     const serial = ++state.requestSerial;
-    const renderAvailableTiles = (previewAllowed = true) => {
-      const availableTiles = tiles.filter((tile) => state.tileCache.has(tileKey(tile)));
-      if (availableTiles.length > 0) {
-        render(assembleTerrainFromTiles(availableTiles, circle, index, resolution), state.viewMode);
-        setStatus(`Tiles ${availableTiles.length}/${tiles.length} · ${lod.tileSize / 1000} km @ ${resolution} m · point ${index + 1}/${state.meta.flightPath.length}`);
-        return true;
+
+    // Show overview immediately if no tiles available yet
+    const availableTiles = tiles.filter((tile) => state.tileCache.has(tileKey(tile)));
+    if (availableTiles.length === 0 && !state.data) {
+      const preview = overviewFor(index, radius);
+      if (preview) {
+        render(preview, state.viewMode);
+        setStatus(`Preview while loading ${tiles.length} terrain tiles...`);
       }
-      if (previewAllowed) {
-        const preview = overviewFor(index, radius);
-        if (preview) {
-          render(preview, state.viewMode);
-          setStatus(`Preview while loading ${tiles.length} terrain tiles...`);
-          return true;
-        }
-      }
-      return false;
-    };
+    }
 
     if (missingTiles.length === 0) {
-      window.clearTimeout(state.pendingRequest);
-      renderAvailableTiles(false);
+      if (availableTiles.length > 0) {
+        render(assembleTerrainFromTiles(availableTiles, circle, index, resolution), state.viewMode);
+      }
       return;
     }
 
-    const isFirstLoad = !state.data;
-    renderAvailableTiles(isFirstLoad);
-
     window.clearTimeout(state.pendingRequest);
-    state.pendingRequest = window.setTimeout(async () => {
+    state.pendingRequest = setTimeout(async () => {
       if (serial !== state.requestSerial) return;
 
       setStatus(`Loading ${missingTiles.length}/${tiles.length} terrain tiles (${lod.tileSize / 1000} km @ ${resolution} m)...`);
-      const fetchStart = performance.now();
 
-      if (isFirstLoad) {
-        let completedTiles = 0;
-        for (const tile of missingTiles) {
-          ensureTile(tile)
-            .then(({ cached, jsonMs }) => {
-              completedTiles += 1;
-              if (serial !== state.requestSerial) return;
-              const renderStart = performance.now();
-              renderAvailableTiles(false);
-              console.log("[terrain] tile arrived", {
-                tile: tileKey(tile),
-                cached,
-                jsonMs: Math.round(jsonMs),
-                completedTiles,
-                missingTiles: missingTiles.length,
-                elapsedMs: Math.round(performance.now() - fetchStart),
-                renderMs: Math.round(performance.now() - renderStart),
-              });
-            })
-            .catch((error) => {
-              if (serial === state.requestSerial) {
-                setStatus(`Terrain tile failed: ${error.message}`);
-              }
-            });
-        }
-      } else {
-        const promises = missingTiles.map((tile) =>
-          ensureTile(tile).catch(() => {})
-        );
-        await Promise.allSettled(promises);
-        if (serial === state.requestSerial) {
-          renderAvailableTiles(false);
+      const promises = missingTiles.map((tile) =>
+        ensureTile(tile).catch(() => {})
+      );
+      await Promise.allSettled(promises);
+      if (serial === state.requestSerial) {
+        const updatedTiles = tiles.filter((tile) => state.tileCache.has(tileKey(tile)));
+        if (updatedTiles.length > 0) {
+          render(assembleTerrainFromTiles(updatedTiles, circle, index, resolution), state.viewMode);
         }
       }
 
@@ -725,7 +715,7 @@
         tileSize: lod.tileSize,
         resolution,
       });
-    }, 180);
+    }, 0);
   }
 
   function render(data, viewMode) {
@@ -775,7 +765,9 @@
   }
 
   window.renderTerrainViewer = render;
-  window.addEventListener("resize", () => setCamera(state.viewMode));
+  window.addEventListener("resize", () => {
+    if (state.data) setCamera(state.viewMode);
+  });
   window.addEventListener("DOMContentLoaded", () => {
     if (window.TERRAIN_META) {
       state.meta = window.TERRAIN_META;
@@ -784,9 +776,11 @@
       state.minCutoutRadius = state.meta.minRadius;
       state.maxCutoutRadius = state.meta.maxRadius;
       state.cutoutRadius = state.maxCutoutRadius;
+      state.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10000, 50000);
       installScrubber();
-      // Don't fetch tiles yet — overview preview shows full zoom-out view.
-      // Tiles load on first interaction (zoom/scrub/drag).
+      // Show overview immediately so first interaction is instant
+      const preview = overviewFor(0, state.maxCutoutRadius);
+      if (preview) render(preview, state.viewMode);
     } else {
       setStatus("No embedded terrain metadata");
     }
