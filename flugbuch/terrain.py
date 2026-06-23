@@ -185,10 +185,11 @@ def webgl_tile_payload(tile_x0: float, tile_y0: float, resolution_m: float, tile
     x0 = float(tile_x0)
     y0 = float(tile_y0)
     resolution = float(resolution_m)
-    tile_points = int(round(tile_size_m / resolution))
+    # inclusive grid: one extra row/col at the east/north boundary
+    tile_points = int(round(tile_size_m / resolution)) + 1
     x = x0 + np.arange(tile_points) * resolution
     y = y0 + np.arange(tile_points) * resolution
-    cache_key = f"s{tile_size_m}_r{resolution:g}_x{int(x0)}_y{int(y0)}.npy"
+    cache_key = f"v2_s{tile_size_m}_r{resolution:g}_x{int(x0)}_y{int(y0)}.npy"
     cached_path = WEBGL_TILE_CACHE_DIR / cache_key
 
     cache_start = perf_counter()

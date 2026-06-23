@@ -16,6 +16,8 @@
     terrainCache: new Map(),
     tileCache: new Map(),
     pendingTileRequests: new Map(),
+    textureCache: new Map(),
+    pendingTextureRequests: new Map(),
     azimuth: Math.PI / 4,
     dragging: false,
     dragStartX: 0,
@@ -239,15 +241,22 @@
     }
 
     state.scene = new THREE.Scene();
-    state.scene.background = new THREE.Color(0x0b1020);
-    state.renderer = new THREE.WebGLRenderer({ antialias: true });
+    state.scene.background = null;
+    state.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    state.renderer.shadowMap.enabled = true;
+    state.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     state.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     container.appendChild(state.renderer.domElement);
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.35);
     state.directionalLight = new THREE.DirectionalLight(0xfff1c2, 1.6);
+    state.directionalLight.castShadow = true;
+    state.directionalLight.shadow.mapSize.set(2048, 2048);
+    state.directionalLight.shadow.bias = -0.0005;
+    state.directionalLight.shadow.normalBias = 0.02;
+    state.directionalLight.shadow.radius = 2;
     state.directionalLight.position.set(-0.7, 0.45, 1.0);
-    state.scene.add(ambient, state.directionalLight);
+    state.scene.add(ambient, state.directionalLight, state.directionalLight.target);
   }
 
   function installDrag(container) {
@@ -278,11 +287,14 @@
       state.dragging = false;
     });
 
+    let wheelTimeout = 0;
     container.addEventListener("wheel", (event) => {
       event.preventDefault();
       const factor = Math.exp(event.deltaY * 0.0012);
       state.cutoutRadius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius * factor));
-      requestTerrain();
+      if (state.data) setCamera(state.viewMode);
+      clearTimeout(wheelTimeout);
+      wheelTimeout = setTimeout(() => requestTerrain(), 120);
     }, { passive: false });
   }
 
@@ -346,8 +358,27 @@
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    const material = new THREE.MeshLambertMaterial({ color: 0xc8c0b0, side: THREE.DoubleSide });
-    state.root.add(new THREE.Mesh(geometry, material));
+    // Slope-based coloring: flat = darker/warmer, steep = lighter/colder
+    const normals = geometry.attributes.normal.array;
+    const colors = new Float32Array(normals.length);
+    for (let i = 0; i < normals.length; i += 3) {
+      const ny = normals[i + 1]; // Y is up
+      const flatness = THREE.MathUtils.clamp(ny, 0, 1);
+      // Use power curve for stronger contrast: flat→warm brown #7a5c3a, steep→cool pale #c8d0e8
+      const t = Math.pow(1 - flatness, 0.6);
+      const r = THREE.MathUtils.lerp(122 / 255, 200 / 255, t);
+      const g = THREE.MathUtils.lerp(92 / 255, 208 / 255, t);
+      const b = THREE.MathUtils.lerp(58 / 255, 232 / 255, t);
+      colors[i] = r;
+      colors[i + 1] = g;
+      colors[i + 2] = b;
+    }
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.receiveShadow = true;
+    state.root.add(mesh);
 
     buildEdgeFill(data);
     buildCylinderWall(data, baseHeight);
@@ -388,7 +419,9 @@
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
     const material = new THREE.MeshLambertMaterial({ color: 0xc8c0b0, side: THREE.DoubleSide });
-    state.root.add(new THREE.Mesh(geometry, material));
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.receiveShadow = true;
+    state.root.add(mesh);
     console.timeEnd("[terrain] build edge fill");
   }
 
@@ -426,7 +459,30 @@
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
     const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
-    state.root.add(new THREE.Mesh(geometry, material));
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.receiveShadow = true;
+    state.root.add(mesh);
+
+    // Strongly blurred shadow disc under cylinder (multiple concentric rings)
+    for (let i = 0; i < 6; i++) {
+      const inner = radius * (0.85 + i * 0.05);
+      const outer = radius * (1.15 - i * 0.05);
+      const opacity = 0.08 * (1 - i / 6);
+      const ringGeo = new THREE.RingGeometry(inner, outer, 64);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        opacity,
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(0, baseHeight + 0.5, 0);
+      ring.receiveShadow = true;
+      state.root.add(ring);
+    }
+
     console.timeEnd("[terrain] build cylinder wall");
   }
 
@@ -493,6 +549,8 @@
     const dir = (directions && directions[index]) || mean;
     if (!dir) return;
     state.directionalLight.position.set(dir[0], dir[2], -dir[1]);
+    state.directionalLight.target.position.set(0, 0, 0);
+    state.directionalLight.shadow.camera.lookAt(0, 0, 0);
   }
 
   function setCamera(viewMode) {
@@ -526,6 +584,18 @@
       state.camera.lookAt(0, midHeight, 0);
     }
     state.camera.updateProjectionMatrix();
+
+    // Shadow camera frustum covers the visible terrain circle
+    const shadowCam = state.directionalLight.shadow.camera;
+    const pad = radius * 0.1;
+    shadowCam.left = -radius - pad;
+    shadowCam.right = radius + pad;
+    shadowCam.top = radius + pad;
+    shadowCam.bottom = -radius - pad;
+    shadowCam.near = terrain.zMin - 500;
+    shadowCam.far = terrain.zMax + 500;
+    shadowCam.updateProjectionMatrix();
+
     state.renderer.setSize(width, height, false);
     state.renderer.render(state.scene, state.camera);
     updateScaleBar(width);
@@ -552,16 +622,18 @@
     }
     state.root = new THREE.Group();
     state.scene.add(state.root);
+
     buildTerrain(state.data);
     buildOverlays(state.data);
     setCamera(state.viewMode);
     const label = state.data.preview ? "Preview" : "Cutout";
-    setStatus(`${label} ${Math.round(viewRadius())} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`);
+    const radius = viewRadius();
+    setStatus(`${label} ${Math.round(radius)} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`);
     console.log("[terrain] rebuild geometry timing", {
       preview: !!state.data.preview,
       totalMs: Math.round(performance.now() - start),
       grid: `${state.data.terrain.width}x${state.data.terrain.height}`,
-      radius: Math.round(state.data.circle.radius),
+      radius: Math.round(radius),
       resolution: state.data.resolution,
     });
   }
@@ -602,7 +674,8 @@
       return;
     }
 
-    renderAvailableTiles(true);
+    const isFirstLoad = !state.data;
+    renderAvailableTiles(isFirstLoad);
 
     window.clearTimeout(state.pendingRequest);
     state.pendingRequest = window.setTimeout(async () => {
@@ -610,30 +683,42 @@
 
       setStatus(`Loading ${missingTiles.length}/${tiles.length} terrain tiles (${lod.tileSize / 1000} km @ ${resolution} m)...`);
       const fetchStart = performance.now();
-      let completedTiles = 0;
-      for (const tile of missingTiles) {
-        ensureTile(tile)
-          .then(({ cached, jsonMs }) => {
-            completedTiles += 1;
-            if (serial !== state.requestSerial) return;
-            const renderStart = performance.now();
-            renderAvailableTiles(false);
-            console.log("[terrain] tile arrived", {
-              tile: tileKey(tile),
-              cached,
-              jsonMs: Math.round(jsonMs),
-              completedTiles,
-              missingTiles: missingTiles.length,
-              elapsedMs: Math.round(performance.now() - fetchStart),
-              renderMs: Math.round(performance.now() - renderStart),
+
+      if (isFirstLoad) {
+        let completedTiles = 0;
+        for (const tile of missingTiles) {
+          ensureTile(tile)
+            .then(({ cached, jsonMs }) => {
+              completedTiles += 1;
+              if (serial !== state.requestSerial) return;
+              const renderStart = performance.now();
+              renderAvailableTiles(false);
+              console.log("[terrain] tile arrived", {
+                tile: tileKey(tile),
+                cached,
+                jsonMs: Math.round(jsonMs),
+                completedTiles,
+                missingTiles: missingTiles.length,
+                elapsedMs: Math.round(performance.now() - fetchStart),
+                renderMs: Math.round(performance.now() - renderStart),
+              });
+            })
+            .catch((error) => {
+              if (serial === state.requestSerial) {
+                setStatus(`Terrain tile failed: ${error.message}`);
+              }
             });
-          })
-          .catch((error) => {
-            if (serial === state.requestSerial) {
-              setStatus(`Terrain tile failed: ${error.message}`);
-            }
-          });
+        }
+      } else {
+        const promises = missingTiles.map((tile) =>
+          ensureTile(tile).catch(() => {})
+        );
+        await Promise.allSettled(promises);
+        if (serial === state.requestSerial) {
+          renderAvailableTiles(false);
+        }
       }
+
       console.log("[terrain] tile requests started", {
         missingTiles: missingTiles.length,
         totalTiles: tiles.length,
@@ -700,7 +785,8 @@
       state.maxCutoutRadius = state.meta.maxRadius;
       state.cutoutRadius = state.maxCutoutRadius;
       installScrubber();
-      requestTerrain();
+      // Don't fetch tiles yet — overview preview shows full zoom-out view.
+      // Tiles load on first interaction (zoom/scrub/drag).
     } else {
       setStatus("No embedded terrain metadata");
     }

@@ -7,6 +7,7 @@ from time import perf_counter
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .flight import FlightCollection, PROJECT_ROOT, load_flight
+from .imagery import texture_for_tile
 from .terrain import adaptive_terrain_around_path, full_flight_circle, webgl_local_terrain_payload, webgl_terrain_payload, webgl_tile_payload
 
 
@@ -17,7 +18,7 @@ def test_flight():
     if len(paths) == 0:
         raise ValueError("Need at least one valid flight for the WebGL test page.")
 
-    path = paths[-2]
+    path = paths[-1]
     print(f"[terrain] test flight {path}", flush=True)
     flight = load_flight(path)
     return flight, path.relative_to(PROJECT_ROOT).as_posix()
@@ -107,6 +108,24 @@ def create_app() -> Flask:
         )
         return response
 
+    @app.get("/terrain-texture")
+    def terrain_texture() -> Response:
+        x0 = float(request.args["x0"])
+        y0 = float(request.args["y0"])
+        resolution = float(request.args.get("resolution", 5))
+        size = int(request.args.get("size", 1000))
+        layer = request.args.get("layer", "swissimage")
+        if layer not in ("swissimage", "pixelkarte"):
+            return Response(status=400)
+        start = perf_counter()
+        data = texture_for_tile(x0, y0, size, resolution, layer)
+        ms = (perf_counter() - start) * 1000
+        if data is None:
+            print(f"[terrain] texture MISS  x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={size} layer={layer} ({ms:.0f} ms)", flush=True)
+            return Response(status=404)
+        print(f"[terrain] texture HIT   x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={size} layer={layer} ({len(data)} bytes, {ms:.0f} ms)", flush=True)
+        return Response(data, mimetype="image/jpeg")
+
     @app.get("/")
     def index() -> Response:
         metadata, overview_payload, flight_label = flight_metadata()
@@ -120,7 +139,7 @@ def create_app() -> Flask:
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>Flugbuch WebGL Terrain Test</title>
                 <style>
-                    html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0b1020; }}
+                    html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: linear-gradient(180deg, #e8ecf0 0%, #ffffff 60%, #ffffff 100%); }}
                     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
                     #terrain-viewer {{ position: fixed; inset: 0; }}
                     #terrain-viewer canvas {{ display: block; width: 100%; height: 100%; }}
