@@ -129,12 +129,13 @@ def adaptive_terrain_around_path(
     return terrain_around_path(xy, resolution_m=resolution, margin_m=margin_m)
 
 
-def full_flight_circle(xy: np.ndarray, margin_m: float = 300) -> tuple[np.ndarray, float]:
+def full_flight_circle(xy: np.ndarray, margin_factor: float = 0.2) -> tuple[np.ndarray, float]:
     center = np.array([
         (float(xy[:, 0].min()) + float(xy[:, 0].max())) / 2,
         (float(xy[:, 1].min()) + float(xy[:, 1].max())) / 2,
     ])
-    radius = float(np.linalg.norm(xy - center, axis=1).max() + margin_m)
+    max_dist = float(np.linalg.norm(xy - center, axis=1).max())
+    radius = float(max_dist * (1 + margin_factor))
     return center, radius
 
 

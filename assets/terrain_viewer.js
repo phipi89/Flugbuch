@@ -30,6 +30,7 @@
     cutoutRadius: 1200,
     minCutoutRadius: 450,
     maxCutoutRadius: 1200,
+    playTimer: null,
   };
 
   function setStatus(message) {
@@ -51,12 +52,18 @@
   }
 
   function viewCenter() {
-    const point = state.data.flightPath[Math.min(state.focusIndex, state.data.flightPath.length - 1)];
+    const point =
+      state.data.flightPath[
+        Math.min(state.focusIndex, state.data.flightPath.length - 1)
+      ];
     return clampedCenterFor(point, viewRadius());
   }
 
   function viewRadius() {
-    return Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius));
+    return Math.max(
+      state.minCutoutRadius,
+      Math.min(state.maxCutoutRadius, state.cutoutRadius),
+    );
   }
 
   function clampedCenterFor(point, radius) {
@@ -67,12 +74,18 @@
     const dy = point[1] - fullCenter[1];
     const distance = Math.hypot(dx, dy);
     if (distance <= maxDistance || distance === 0) return [point[0], point[1]];
-    return [fullCenter[0] + dx / distance * maxDistance, fullCenter[1] + dy / distance * maxDistance];
+    return [
+      fullCenter[0] + (dx / distance) * maxDistance,
+      fullCenter[1] + (dy / distance) * maxDistance,
+    ];
   }
 
   function overviewFor(index, radius) {
     if (!state.overviewData || !state.meta) return null;
-    const point = state.meta.flightPath[Math.max(0, Math.min(state.meta.flightPath.length - 1, index))];
+    const point =
+      state.meta.flightPath[
+        Math.max(0, Math.min(state.meta.flightPath.length - 1, index))
+      ];
     return {
       ...state.overviewData,
       circle: {
@@ -126,11 +139,17 @@
   }
 
   function assembleTerrainFromTiles(tiles, circle, focusIndex, resolution) {
-    const tilePayloads = tiles.map((tile) => state.tileCache.get(tileKey(tile)).tile);
+    const tilePayloads = tiles.map(
+      (tile) => state.tileCache.get(tileKey(tile)).tile,
+    );
     const minX = Math.min(...tilePayloads.map((tile) => tile.x0));
     const minY = Math.min(...tilePayloads.map((tile) => tile.y0));
-    const maxX = Math.max(...tilePayloads.map((tile) => tile.x0 + tile.resolution * tile.width));
-    const maxY = Math.max(...tilePayloads.map((tile) => tile.y0 + tile.resolution * tile.height));
+    const maxX = Math.max(
+      ...tilePayloads.map((tile) => tile.x0 + tile.resolution * tile.width),
+    );
+    const maxY = Math.max(
+      ...tilePayloads.map((tile) => tile.y0 + tile.resolution * tile.height),
+    );
     const width = Math.round((maxX - minX) / resolution);
     const height = Math.round((maxY - minY) / resolution);
     const z = new Array(width * height).fill(NaN);
@@ -188,15 +207,23 @@
   function ensureTile(tile) {
     const key = tileKey(tile);
     if (state.tileCache.has(key)) {
-      return Promise.resolve({ tile, payload: state.tileCache.get(key), cached: true, jsonMs: 0 });
+      return Promise.resolve({
+        tile,
+        payload: state.tileCache.get(key),
+        cached: true,
+        jsonMs: 0,
+      });
     }
     if (state.pendingTileRequests.has(key)) {
       return state.pendingTileRequests.get(key);
     }
 
     const promise = (async () => {
-      const response = await fetch(`/terrain-tile?x0=${tile.x0}&y0=${tile.y0}&resolution=${tile.resolution}&size=${tile.size}`);
-      if (!response.ok) throw new Error(`tile ${key} failed: ${response.status}`);
+      const response = await fetch(
+        `/terrain-tile?x0=${tile.x0}&y0=${tile.y0}&resolution=${tile.resolution}&size=${tile.size}`,
+      );
+      if (!response.ok)
+        throw new Error(`tile ${key} failed: ${response.status}`);
       const jsonStart = performance.now();
       const payload = await response.json();
       const jsonMs = performance.now() - jsonStart;
@@ -211,8 +238,14 @@
   }
 
   function sampleHeight(terrain, x, y) {
-    const gx = Math.max(0, Math.min(terrain.width - 1, (x - terrain.x0) / terrain.dx));
-    const gy = Math.max(0, Math.min(terrain.height - 1, (y - terrain.y0) / terrain.dy));
+    const gx = Math.max(
+      0,
+      Math.min(terrain.width - 1, (x - terrain.x0) / terrain.dx),
+    );
+    const gy = Math.max(
+      0,
+      Math.min(terrain.height - 1, (y - terrain.y0) / terrain.dy),
+    );
     const x0 = Math.floor(gx);
     const y0 = Math.floor(gy);
     const x1 = Math.min(terrain.width - 1, x0 + 1);
@@ -223,11 +256,17 @@
     const z10 = terrain.z[y0 * terrain.width + x1];
     const z01 = terrain.z[y1 * terrain.width + x0];
     const z11 = terrain.z[y1 * terrain.width + x1];
-    return z00 * (1 - tx) * (1 - ty) + z10 * tx * (1 - ty) + z01 * (1 - tx) * ty + z11 * tx * ty;
+    return (
+      z00 * (1 - tx) * (1 - ty) +
+      z10 * tx * (1 - ty) +
+      z01 * (1 - tx) * ty +
+      z11 * tx * ty
+    );
   }
 
   function meshStride(terrain, radius) {
-    const estimatedVertices = Math.PI * radius * radius / Math.max(1, terrain.dx * terrain.dy);
+    const estimatedVertices =
+      (Math.PI * radius * radius) / Math.max(1, terrain.dx * terrain.dy);
     if (estimatedVertices > 600000) return 4;
     if (estimatedVertices > 300000) return 3;
     if (estimatedVertices > 120000) return 2;
@@ -235,7 +274,10 @@
   }
 
   function resetScene(container) {
-    console.log("[terrain] reset scene", { width: container.clientWidth, height: container.clientHeight });
+    console.log("[terrain] reset scene", {
+      width: container.clientWidth,
+      height: container.clientHeight,
+    });
     if (state.renderer) {
       state.renderer.dispose();
       container.replaceChildren();
@@ -249,15 +291,19 @@
     state.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     container.appendChild(state.renderer.domElement);
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
-    state.directionalLight = new THREE.DirectionalLight(0xfff1c2, 1.6);
+    const ambient = new THREE.AmbientLight(0xffffff, 0.85);
+    state.directionalLight = new THREE.DirectionalLight(0xffffff, 1.6);
     state.directionalLight.castShadow = true;
     state.directionalLight.shadow.mapSize.set(2048, 2048);
     state.directionalLight.shadow.bias = -0.0005;
     state.directionalLight.shadow.normalBias = 0.02;
     state.directionalLight.shadow.radius = 2;
     state.directionalLight.position.set(-0.7, 0.45, 1.0);
-    state.scene.add(ambient, state.directionalLight, state.directionalLight.target);
+    state.scene.add(
+      ambient,
+      state.directionalLight,
+      state.directionalLight.target,
+    );
   }
 
   function installDrag(container) {
@@ -275,7 +321,7 @@
     container.addEventListener("pointermove", (event) => {
       if (!state.dragging) return;
       const dx = event.clientX - state.dragStartX;
-      state.azimuth = state.dragStartAzimuth - dx * 0.008;
+      state.azimuth = state.dragStartAzimuth + dx * 0.008;
       setCamera(state.viewMode);
     });
 
@@ -289,14 +335,21 @@
     });
 
     let wheelTimeout = 0;
-    container.addEventListener("wheel", (event) => {
-      event.preventDefault();
-      const factor = Math.exp(event.deltaY * 0.0012);
-      state.cutoutRadius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius * factor));
-      if (state.data) rebuildGeometry();
-      clearTimeout(wheelTimeout);
-      wheelTimeout = setTimeout(() => requestTerrain(), 120);
-    }, { passive: false });
+    container.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        const factor = Math.exp(event.deltaY * 0.0012);
+        state.cutoutRadius = Math.max(
+          state.minCutoutRadius,
+          Math.min(state.maxCutoutRadius, state.cutoutRadius * factor),
+        );
+        if (state.data) rebuildGeometry();
+        clearTimeout(wheelTimeout);
+        wheelTimeout = setTimeout(() => requestTerrain(), 120);
+      },
+      { passive: false },
+    );
   }
 
   function installScrubber() {
@@ -311,6 +364,8 @@
       state.focusIndex = Number(scrubber.value);
       updateSunLight(state.focusIndex);
       if (state.data) rebuildGeometry();
+      clearTimeout(state.playTimer);
+      scheduleNext();
       requestTerrain();
     });
   }
@@ -320,7 +375,7 @@
     const terrain = data.terrain;
     const center = viewCenter();
     const radius = viewRadius();
-    const baseHeight = terrain.zMin - Math.max(100, (terrain.zMax - terrain.zMin) * 0.14);
+    const baseHeight = 0;
     const stride = meshStride(terrain, radius);
     const positions = [];
     const sampledWidth = Math.ceil(terrain.width / stride);
@@ -356,28 +411,37 @@
     }
 
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    // Slope-based coloring: flat = darker/warmer, steep = lighter/colder
+    // Slope-based coloring: flat (warm white) → steep (light blue)
     const normals = geometry.attributes.normal.array;
+    const flatColor = 0xfff8f0,
+      steepColor = 0xb8d0f0;
+    const fr = ((flatColor >> 16) & 0xff) / 255,
+      fg = ((flatColor >> 8) & 0xff) / 255,
+      fb = (flatColor & 0xff) / 255;
+    const sr = ((steepColor >> 16) & 0xff) / 255,
+      sg = ((steepColor >> 8) & 0xff) / 255,
+      sb = (steepColor & 0xff) / 255;
     const colors = new Float32Array(normals.length);
     for (let i = 0; i < normals.length; i += 3) {
-      const ny = normals[i + 1]; // Y is up
-      const flatness = THREE.MathUtils.clamp(ny, 0, 1);
-      // Use power curve for stronger contrast: flat→warm brown #7a5c3a, steep→cool pale #c8d0e8
-      const t = Math.pow(1 - flatness, 0.6);
-      const r = THREE.MathUtils.lerp(122 / 255, 200 / 255, t);
-      const g = THREE.MathUtils.lerp(92 / 255, 208 / 255, t);
-      const b = THREE.MathUtils.lerp(58 / 255, 232 / 255, t);
-      colors[i] = r;
-      colors[i + 1] = g;
-      colors[i + 2] = b;
+      const ny = -1 * normals[i + 1];
+      const t = Math.pow(1 - THREE.MathUtils.clamp(ny, 0, 1), 0.6);
+      colors[i] = THREE.MathUtils.lerp(fr, sr, t);
+      colors[i + 1] = THREE.MathUtils.lerp(fg, sg, t);
+      colors[i + 2] = THREE.MathUtils.lerp(fb, sb, t);
     }
     geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
 
-    const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const material = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+    });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     state.root.add(mesh);
@@ -385,7 +449,11 @@
     buildEdgeFill(data);
     buildCylinderWall(data, baseHeight);
     console.timeEnd("[terrain] build terrain mesh");
-    console.log("[terrain] terrain mesh ready", { vertices: positions.length / 3, triangles: indices.length / 3, stride });
+    console.log("[terrain] terrain mesh ready", {
+      vertices: positions.length / 3,
+      triangles: indices.length / 3,
+      stride,
+    });
   }
 
   function buildEdgeFill(data) {
@@ -393,7 +461,10 @@
     const terrain = data.terrain;
     const center = viewCenter();
     const radius = viewRadius();
-    const innerRadius = Math.max(1, radius - Math.max(terrain.dx, terrain.dy) * 2.2);
+    const innerRadius = Math.max(
+      1,
+      radius - Math.max(terrain.dx, terrain.dy) * 2.2,
+    );
     const segments = 256;
     const positions = [];
     const indices = [];
@@ -417,10 +488,16 @@
     }
 
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-    const material = new THREE.MeshLambertMaterial({ color: 0xc8c0b0, side: THREE.DoubleSide });
+    const material = new THREE.MeshLambertMaterial({
+      color: 0xc8c0b0,
+      side: THREE.DoubleSide,
+    });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     state.root.add(mesh);
@@ -444,7 +521,7 @@
       const z = sampleHeight(terrain, x, y);
       positions.push(localX(x, center), z, localY(y, center));
       positions.push(localX(x, center), baseHeight, localY(y, center));
-      colors.push(0.32, 0.27, 0.18, 0.13, 0.10, 0.08);
+      colors.push(0.32, 0.27, 0.18, 0.13, 0.1, 0.08);
     }
 
     for (let i = 0; i < segments; i += 1) {
@@ -456,11 +533,17 @@
     }
 
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(positions, 3),
+    );
     geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
-    const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const material = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+    });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     state.root.add(mesh);
@@ -471,15 +554,23 @@
     shadowCanvas.width = shadowSize;
     shadowCanvas.height = shadowSize;
     const shadowCtx = shadowCanvas.getContext("2d");
-    const grad = shadowCtx.createRadialGradient(shadowSize / 2, shadowSize / 2, 0, shadowSize / 2, shadowSize / 2, shadowSize / 2);
-    grad.addColorStop(0, "rgba(0,0,0,0.22)");
-    grad.addColorStop(0.35, "rgba(0,0,0,0.14)");
-    grad.addColorStop(0.65, "rgba(0,0,0,0.05)");
+    const grad = shadowCtx.createRadialGradient(
+      shadowSize / 2,
+      shadowSize / 2,
+      0,
+      shadowSize / 2,
+      shadowSize / 2,
+      shadowSize / 2,
+    );
+    grad.addColorStop(0, "rgba(0,0,0,0.5)");
     grad.addColorStop(1, "rgba(0,0,0,0)");
     shadowCtx.fillStyle = grad;
     shadowCtx.fillRect(0, 0, shadowSize, shadowSize);
     const shadowTexture = new THREE.CanvasTexture(shadowCanvas);
-    const shadowGeo = new THREE.PlaneGeometry(radius * 2 * 0.92, radius * 2 * 0.92);
+    const shadowGeo = new THREE.PlaneGeometry(
+      radius * 2 * 0.92,
+      radius * 2 * 0.92,
+    );
     const shadowMat = new THREE.MeshBasicMaterial({
       map: shadowTexture,
       transparent: true,
@@ -488,7 +579,7 @@
     });
     const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
     shadowMesh.rotation.x = -Math.PI / 2;
-    shadowMesh.position.set(0, baseHeight - 2, 0);
+    shadowMesh.position.set(0, baseHeight - Math.max(2, radius * 0.25), 0);
     state.root.add(shadowMesh);
 
     console.timeEnd("[terrain] build cylinder wall");
@@ -518,7 +609,13 @@
       const dx = point[0] - center[0];
       const dy = point[1] - center[1];
       if (dx * dx + dy * dy <= circleRadius * circleRadius) {
-        currentSegment.push(new THREE.Vector3(localX(point[0], center), point[2] + topLift, localY(point[1], center)));
+        currentSegment.push(
+          new THREE.Vector3(
+            localX(point[0], center),
+            point[2] + topLift,
+            localY(point[1], center),
+          ),
+        );
       } else {
         if (currentSegment.length > 1) pathSegments.push(currentSegment);
         currentSegment = [];
@@ -528,16 +625,36 @@
     for (const seg of pathSegments) {
       if (seg.length < 2) continue;
       const curve = new THREE.CatmullRomCurve3(seg);
-      const tubeGeo = new THREE.TubeGeometry(curve, seg.length * 2, Math.max(1.2, circleRadius * 0.003), 6, false);
-      state.root.add(new THREE.Mesh(tubeGeo, new THREE.MeshBasicMaterial({ color: 0x222222, transparent: true, opacity: 0.6 })));
+      const tubeGeo = new THREE.TubeGeometry(
+        curve,
+        seg.length * 2,
+        Math.max(1.2, circleRadius * 0.003),
+        6,
+        false,
+      );
+      state.root.add(
+        new THREE.Mesh(
+          tubeGeo,
+          new THREE.MeshBasicMaterial({
+            color: 0xffffff,
+            transparent: true,
+            opacity: 0.8,
+          }),
+        ),
+      );
     }
 
-    const focusPoint = data.flightPath[Math.min(state.focusIndex, data.flightPath.length - 1)];
+    const focusPoint =
+      data.flightPath[Math.min(state.focusIndex, data.flightPath.length - 1)];
     const marker = new THREE.Mesh(
       new THREE.SphereGeometry(Math.max(18, circleRadius * 0.018), 24, 12),
-      new THREE.MeshBasicMaterial({ color: 0xf97316 })
+      new THREE.MeshBasicMaterial({ color: 0xf97316 }),
     );
-    marker.position.set(localX(focusPoint[0], center), focusPoint[2] + topLift + 28, localY(focusPoint[1], center));
+    marker.position.set(
+      localX(focusPoint[0], center),
+      focusPoint[2] + topLift + 28,
+      localY(focusPoint[1], center),
+    );
     state.root.add(marker);
 
     const rim = [];
@@ -545,7 +662,13 @@
       const angle = (i / 192) * Math.PI * 2;
       const x = center[0] + Math.cos(angle) * circleRadius;
       const y = center[1] + Math.sin(angle) * circleRadius;
-      rim.push(new THREE.Vector3(localX(x, center), sampleHeight(terrain, x, y) + 18, localY(y, center)));
+      rim.push(
+        new THREE.Vector3(
+          localX(x, center),
+          sampleHeight(terrain, x, y) + 18,
+          localY(y, center),
+        ),
+      );
     }
     state.root.add(buildLine(rim, 0xdde7f3, 1));
 
@@ -556,7 +679,7 @@
 
     const arc = [];
     const arcRadius = circleRadius * 1.065;
-    const arcHeight = terrain.zMax + 120;
+    const arcHeight = circleRadius * 1.5; //terrain.zMax + 120;
     for (let i = 0; i <= 80; i += 1) {
       const angle = start + (end - start) * (i / 80);
       const x = Math.cos(angle) * arcRadius;
@@ -564,8 +687,23 @@
       arc.push(new THREE.Vector3(x, arcHeight, y));
     }
     const arcCurve = new THREE.CatmullRomCurve3(arc);
-    const arcGeo = new THREE.TubeGeometry(arcCurve, 80, Math.max(2.5, circleRadius * 0.008), 6, false);
-    state.root.add(new THREE.Mesh(arcGeo, new THREE.MeshBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.5 })));
+    const arcGeo = new THREE.TubeGeometry(
+      arcCurve,
+      80,
+      Math.max(2.5, circleRadius * 0.008),
+      6,
+      false,
+    );
+    state.root.add(
+      new THREE.Mesh(
+        arcGeo,
+        new THREE.MeshBasicMaterial({
+          color: 0xf59e0b,
+          transparent: true,
+          opacity: 0.35,
+        }),
+      ),
+    );
     console.timeEnd("[terrain] build overlays");
   }
 
@@ -580,6 +718,21 @@
     state.directionalLight.shadow.camera.lookAt(0, 0, 0);
   }
 
+  function scheduleNext() {
+    const secs = state.meta?.timeSeconds;
+    if (!secs || state.focusIndex >= secs.length - 1) return;
+    const dt = (secs[state.focusIndex + 1] - secs[state.focusIndex]) * 1000;
+    clearTimeout(state.playTimer);
+    state.playTimer = setTimeout(() => {
+      state.focusIndex++;
+      const scrubber = document.getElementById("scrub");
+      if (scrubber) scrubber.value = state.focusIndex;
+      updateSunLight(state.focusIndex);
+      if (state.data) rebuildGeometry();
+      scheduleNext();
+    }, dt);
+  }
+
   function setCamera(viewMode) {
     const container = document.getElementById("terrain-viewer");
     if (!container || !state.camera || !state.renderer || !state.data) return;
@@ -589,7 +742,7 @@
     const radius = viewRadius();
     const terrain = state.data.terrain;
     const aspect = width / height;
-    const frustum = radius * 2.55;
+    const frustum = radius * 2;
     state.camera.left = (-frustum * aspect) / 2;
     state.camera.right = (frustum * aspect) / 2;
     state.camera.top = frustum / 2;
@@ -597,18 +750,26 @@
     state.camera.near = -10000;
     state.camera.far = 50000;
 
-    const midHeight = (terrain.zMin + terrain.zMax) / 2;
+    const lookAtY = frustum / 4;
     const directionX = Math.cos(state.azimuth);
     const directionZ = Math.sin(state.azimuth);
     if (viewMode === "isometric") {
       const distance = radius * 1.55;
-      state.camera.position.set(directionX * distance, terrain.zMax + radius * 1.15, directionZ * distance);
+      const distY =
+        terrain.zMax + radius * 1.15 - (terrain.zMin + terrain.zMax) / 2;
+      state.camera.position.set(
+        directionX * distance,
+        lookAtY + distY,
+        directionZ * distance,
+      );
       state.camera.up.set(0, 1, 0);
-      state.camera.lookAt(0, midHeight, 0);
+      state.camera.lookAt(0, lookAtY, 0);
     } else {
-      state.camera.position.set(0, terrain.zMax + radius * 2.2, 0.001);
+      const distY =
+        terrain.zMax + radius * 2.2 - (terrain.zMin + terrain.zMax) / 2;
+      state.camera.position.set(0, lookAtY + distY, 0.001);
       state.camera.up.set(-directionZ, 0, -directionX);
-      state.camera.lookAt(0, midHeight, 0);
+      state.camera.lookAt(0, lookAtY, 0);
     }
     state.camera.updateProjectionMatrix();
 
@@ -619,7 +780,7 @@
     shadowCam.right = radius + pad;
     shadowCam.top = radius + pad;
     shadowCam.bottom = -radius - pad;
-    shadowCam.near = terrain.zMin - 500;
+    shadowCam.near = Math.min(terrain.zMin - 500, -500);
     shadowCam.far = terrain.zMax + 500;
     shadowCam.updateProjectionMatrix();
 
@@ -634,7 +795,7 @@
     if (!bar || !state.camera) return;
 
     const frustumWidth = state.camera.right - state.camera.left;
-    const pixels = 1000 / frustumWidth * width;
+    const pixels = (1000 / frustumWidth) * width;
     bar.style.width = `${Math.max(8, Math.round(pixels))}px`;
   }
 
@@ -652,7 +813,9 @@
     setCamera(state.viewMode);
     const label = state.data.preview ? "Preview" : "Cutout";
     const radius = viewRadius();
-    setStatus(`${label} ${Math.round(radius)} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`);
+    setStatus(
+      `${label} ${Math.round(radius)} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`,
+    );
     console.log("[terrain] rebuild geometry timing", {
       preview: !!state.data.preview,
       totalMs: Math.round(performance.now() - start),
@@ -664,19 +827,29 @@
 
   function requestTerrain() {
     if (!state.meta) return;
-    const radius = Math.max(state.minCutoutRadius, Math.min(state.maxCutoutRadius, state.cutoutRadius));
-    const index = Math.max(0, Math.min(state.meta.flightPath.length - 1, state.focusIndex));
+    const radius = Math.max(
+      state.minCutoutRadius,
+      Math.min(state.maxCutoutRadius, state.cutoutRadius),
+    );
+    const index = Math.max(
+      0,
+      Math.min(state.meta.flightPath.length - 1, state.focusIndex),
+    );
     const focusPoint = state.meta.flightPath[index];
     const center = clampedCenterFor(focusPoint, radius);
     const circle = { center, radius };
     const lod = lodForRadius(radius);
     const resolution = lod.resolution;
     const tiles = neededTiles(center, radius, lod);
-    const missingTiles = tiles.filter((tile) => !state.tileCache.has(tileKey(tile)));
+    const missingTiles = tiles.filter(
+      (tile) => !state.tileCache.has(tileKey(tile)),
+    );
     const serial = ++state.requestSerial;
 
     // Show overview immediately if no tiles available yet
-    const availableTiles = tiles.filter((tile) => state.tileCache.has(tileKey(tile)));
+    const availableTiles = tiles.filter((tile) =>
+      state.tileCache.has(tileKey(tile)),
+    );
     if (availableTiles.length === 0 && !state.data) {
       const preview = overviewFor(index, radius);
       if (preview) {
@@ -687,7 +860,10 @@
 
     if (missingTiles.length === 0) {
       if (availableTiles.length > 0) {
-        render(assembleTerrainFromTiles(availableTiles, circle, index, resolution), state.viewMode);
+        render(
+          assembleTerrainFromTiles(availableTiles, circle, index, resolution),
+          state.viewMode,
+        );
       }
       return;
     }
@@ -696,16 +872,23 @@
     state.pendingRequest = setTimeout(async () => {
       if (serial !== state.requestSerial) return;
 
-      setStatus(`Loading ${missingTiles.length}/${tiles.length} terrain tiles (${lod.tileSize / 1000} km @ ${resolution} m)...`);
+      setStatus(
+        `Loading ${missingTiles.length}/${tiles.length} terrain tiles (${lod.tileSize / 1000} km @ ${resolution} m)...`,
+      );
 
       const promises = missingTiles.map((tile) =>
-        ensureTile(tile).catch(() => {})
+        ensureTile(tile).catch(() => {}),
       );
       await Promise.allSettled(promises);
       if (serial === state.requestSerial) {
-        const updatedTiles = tiles.filter((tile) => state.tileCache.has(tileKey(tile)));
+        const updatedTiles = tiles.filter((tile) =>
+          state.tileCache.has(tileKey(tile)),
+        );
         if (updatedTiles.length > 0) {
-          render(assembleTerrainFromTiles(updatedTiles, circle, index, resolution), state.viewMode);
+          render(
+            assembleTerrainFromTiles(updatedTiles, circle, index, resolution),
+            state.viewMode,
+          );
         }
       }
 
@@ -720,7 +903,12 @@
 
   function render(data, viewMode) {
     const container = document.getElementById("terrain-viewer");
-    console.log("[terrain] render called", { hasData: !!data, viewMode, hasContainer: !!container, hasThree: !!window.THREE });
+    console.log("[terrain] render called", {
+      hasData: !!data,
+      viewMode,
+      hasContainer: !!container,
+      hasThree: !!window.THREE,
+    });
     if (!container) {
       console.warn("[terrain] terrain-viewer container is missing");
       return;
@@ -761,7 +949,11 @@
 
     updateSunLight(state.focusIndex);
     rebuildGeometry();
-    setStatus(viewMode === "isometric" ? "Isometric WebGL terrain" : "Top-down WebGL terrain");
+    setStatus(
+      viewMode === "isometric"
+        ? "Isometric WebGL terrain"
+        : "Top-down WebGL terrain",
+    );
   }
 
   window.renderTerrainViewer = render;
@@ -780,7 +972,10 @@
       installScrubber();
       // Show overview immediately so first interaction is instant
       const preview = overviewFor(0, state.maxCutoutRadius);
-      if (preview) render(preview, state.viewMode);
+      if (preview) {
+        render(preview, state.viewMode);
+        scheduleNext();
+      }
     } else {
       setStatus("No embedded terrain metadata");
     }

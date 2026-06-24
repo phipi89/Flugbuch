@@ -39,8 +39,11 @@ def flight_metadata() -> tuple[dict, dict, str]:
     overview_payload["focusIndex"] = 0
     overview_payload["resolution"] = overview_payload["terrain"]["dx"]
 
+    cumulative_seconds = [(t - flight.time[0]).total_seconds() for t in flight.time]
+
     metadata = {
         "flightPath": flight.xyz.astype(float).tolist(),
+        "timeSeconds": cumulative_seconds,
         "sun": {
             "startAzimuth": float(flight.sun_azimuth[0]),
             "endAzimuth": float(flight.sun_azimuth[-1]),
