@@ -190,5 +190,14 @@ class FlightCollection:
                 paths.append(path)
         return paths
 
+    def latest_valid_path(self) -> Path | None:
+        for path in reversed(self.paths):
+            if (path.parent / "ignore").exists():
+                continue
+            raw = igc_lib.Flight.create_from_file(path)
+            if raw.valid:
+                return path
+        return None
+
     def load(self, path: str | Path) -> Flight:
         return load_flight(path)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from functools import lru_cache
+from pathlib import Path
 from time import perf_counter
 
 from flask import Flask, Response, jsonify, request, send_from_directory
@@ -12,30 +14,86 @@ from .landcover import landcover_overlay
 from .terrain import adaptive_terrain_around_path, full_flight_circle, webgl_local_terrain_payload, webgl_terrain_payload, webgl_tile_payload
 
 
+OVERVIEW_CACHE_DIR = PROJECT_ROOT / "cache" / "webgl_overviews"
+OVERVIEW_CACHE_VERSION = "v3"
+OVERVIEW_TERRAIN_GRID_SIDE = 240
+OVERVIEW_PAYLOAD_GRID_SIDE = 220
+MIN_RADIUS = 1500
+
+
 @lru_cache(maxsize=1)
-def test_flight():
+def test_flight_path() -> tuple[Path, str]:
     collection = FlightCollection()
-    paths = collection.valid_paths()
-    if len(paths) == 0:
+    path = collection.latest_valid_path()
+    if path is None:
         raise ValueError("Need at least one valid flight for the WebGL test page.")
 
-    path = paths[-1]
-    print(f"[terrain] test flight {path}", flush=True)
-    flight = load_flight(path)
-    return flight, path.relative_to(PROJECT_ROOT).as_posix()
+    return path, path.relative_to(PROJECT_ROOT).as_posix()
 
 
 @lru_cache(maxsize=1)
-def flight_metadata() -> tuple[dict, dict, str]:
+def test_flight():
+    path, label = test_flight_path()
+    print(f"[terrain] test flight {path}", flush=True)
+    flight = load_flight(path)
+    return flight, label
+
+
+def overview_cache_path(path: Path) -> Path:
+    stat = path.stat()
+    key_data = "|".join(
+        [
+            OVERVIEW_CACHE_VERSION,
+            path.resolve().as_posix(),
+            str(stat.st_mtime_ns),
+            str(stat.st_size),
+            str(OVERVIEW_TERRAIN_GRID_SIDE),
+            str(OVERVIEW_PAYLOAD_GRID_SIDE),
+            str(MIN_RADIUS),
+        ]
+    )
+    key = hashlib.sha256(key_data.encode()).hexdigest()[:24]
+    return OVERVIEW_CACHE_DIR / f"{key}.jsonl"
+
+
+@lru_cache(maxsize=1)
+def flight_page_payload() -> tuple[str, str, str]:
+    start = perf_counter()
+    path, label = test_flight_path()
+    cached_path = overview_cache_path(path)
+    try:
+        with cached_path.open("rt", encoding="utf-8") as f:
+            cached_label = json.loads(f.readline())
+            metadata_json = f.readline().rstrip("\n")
+            overview_json = f.readline().rstrip("\n")
+        if not metadata_json or not overview_json:
+            raise ValueError("missing cached payload line")
+        print(
+            f"[terrain] overview cache HIT {cached_path.name} ({(perf_counter() - start) * 1000:.0f} ms)",
+            flush=True,
+        )
+        return metadata_json, overview_json, cached_label
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[terrain] overview cache INVALID {cached_path.name}: {exc}", flush=True)
+
+    print(f"[terrain] overview cache MISS {cached_path.name}", flush=True)
+    flight_start = perf_counter()
     flight, label = test_flight()
+    flight_ms = (perf_counter() - flight_start) * 1000
     center, radius = full_flight_circle(flight.xy)
-    overview_terrain = adaptive_terrain_around_path(flight.xy, max_grid_side=240)
-    overview_payload = webgl_terrain_payload(overview_terrain, flight.xyz, flight.sun_azimuth, max_grid_side=220)
+    overview_start = perf_counter()
+    overview_terrain = adaptive_terrain_around_path(flight.xy, max_grid_side=OVERVIEW_TERRAIN_GRID_SIDE)
+    overview_ms = (perf_counter() - overview_start) * 1000
+    payload_start = perf_counter()
+    overview_payload = webgl_terrain_payload(overview_terrain, flight.xyz, flight.sun_azimuth, max_grid_side=OVERVIEW_PAYLOAD_GRID_SIDE)
+    payload_ms = (perf_counter() - payload_start) * 1000
     overview_payload["fullCircle"] = {
         "center": center.astype(float).tolist(),
         "radius": radius,
     }
-    overview_payload["minRadius"] = 1500
+    overview_payload["minRadius"] = MIN_RADIUS
     overview_payload["maxRadius"] = radius
     overview_payload["focusIndex"] = 0
     overview_payload["resolution"] = overview_payload["terrain"]["dx"]
@@ -55,10 +113,31 @@ def flight_metadata() -> tuple[dict, dict, str]:
             "center": center.astype(float).tolist(),
             "radius": radius,
         },
-        "minRadius": 1500,
+        "minRadius": MIN_RADIUS,
         "maxRadius": radius,
     }
-    return metadata, overview_payload, label
+
+    json_start = perf_counter()
+    metadata_json = json.dumps(metadata, separators=(",", ":"))
+    overview_json = json.dumps(overview_payload, separators=(",", ":"))
+    json_ms = (perf_counter() - json_start) * 1000
+
+    cache_start = perf_counter()
+    OVERVIEW_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with cached_path.open("wt", encoding="utf-8") as f:
+        f.write(json.dumps(label, separators=(",", ":")))
+        f.write("\n")
+        f.write(metadata_json)
+        f.write("\n")
+        f.write(overview_json)
+        f.write("\n")
+    cache_ms = (perf_counter() - cache_start) * 1000
+    total_ms = (perf_counter() - start) * 1000
+    print(
+        f"[terrain] overview cache WRITE {cached_path.name} flight={flight_ms:.0f} ms overview={overview_ms:.0f} ms payload={payload_ms:.0f} ms json={json_ms:.0f} ms cache={cache_ms:.0f} ms total={total_ms:.0f} ms",
+        flush=True,
+    )
+    return metadata_json, overview_json, label
 
 
 def create_app() -> Flask:
@@ -144,9 +223,10 @@ def create_app() -> Flask:
 
     @app.get("/")
     def index() -> Response:
-        metadata, overview_payload, flight_label = flight_metadata()
-        metadata_json = json.dumps(metadata, separators=(",", ":"))
-        overview_json = json.dumps(overview_payload, separators=(",", ":"))
+        start = perf_counter()
+        payload_start = perf_counter()
+        metadata_json, overview_json, flight_label = flight_page_payload()
+        payload_ms = (perf_counter() - payload_start) * 1000
         html = f"""
         <!doctype html>
         <html>
@@ -180,6 +260,10 @@ def create_app() -> Flask:
             </body>
         </html>
         """
+        print(
+            f"[terrain] index payload={payload_ms:.0f} ms total={(perf_counter() - start) * 1000:.0f} ms",
+            flush=True,
+        )
         return Response(html, mimetype="text/html")
 
     return app
