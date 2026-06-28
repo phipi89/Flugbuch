@@ -8,6 +8,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .flight import FlightCollection, PROJECT_ROOT, load_flight
 from .imagery import texture_for_tile
+from .landcover import landcover_overlay
 from .terrain import adaptive_terrain_around_path, full_flight_circle, webgl_local_terrain_payload, webgl_terrain_payload, webgl_tile_payload
 
 
@@ -128,6 +129,18 @@ def create_app() -> Flask:
             return Response(status=404)
         print(f"[terrain] texture HIT   x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={size} layer={layer} ({len(data)} bytes, {ms:.0f} ms)", flush=True)
         return Response(data, mimetype="image/jpeg")
+
+    @app.get("/terrain-overlay")
+    def terrain_overlay() -> Response:
+        x0 = float(request.args["x0"])
+        y0 = float(request.args["y0"])
+        width = int(request.args["width"])
+        height = int(request.args["height"])
+        resolution = float(request.args.get("resolution", 5))
+        data = landcover_overlay(x0, y0, width, height, resolution)
+        if data is None:
+            return Response(status=404)
+        return Response(data, mimetype="image/png")
 
     @app.get("/")
     def index() -> Response:

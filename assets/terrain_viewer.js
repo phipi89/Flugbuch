@@ -6,6 +6,7 @@
     scene: null,
     camera: null,
     root: null,
+    overlayRoot: null,
     data: null,
     meta: null,
     overviewData: null,
@@ -18,6 +19,9 @@
     pendingTileRequests: new Map(),
     textureCache: new Map(),
     pendingTextureRequests: new Map(),
+    overlayTextureCache: new Map(),
+    pendingOverlayRequests: new Map(),
+    activeOverlay: null,
     azimuth: Math.PI / 4,
     dragging: false,
     dragStartX: 0,
@@ -237,6 +241,48 @@
     return promise;
   }
 
+  function overlayKey(terrain) {
+    const spec = overlaySpec(terrain);
+    return `${spec.x0}:${spec.y0}:${spec.width}:${spec.height}:${spec.resolution}`;
+  }
+
+  function overlaySpec(terrain) {
+    const resolution = Math.max(terrain.dx, 20);
+    const width = Math.round(((terrain.width - 1) * terrain.dx) / resolution) + 1;
+    const height = Math.round(((terrain.height - 1) * terrain.dy) / resolution) + 1;
+    return { x0: terrain.x0, y0: terrain.y0, width, height, resolution };
+  }
+
+  function ensureOverlayTexture(terrain) {
+    const spec = overlaySpec(terrain);
+    const key = overlayKey(terrain);
+    if (state.overlayTextureCache.has(key)) {
+      return Promise.resolve({ texture: state.overlayTextureCache.get(key), spec });
+    }
+    if (state.pendingOverlayRequests.has(key)) return state.pendingOverlayRequests.get(key);
+
+    const url = `/terrain-overlay?x0=${spec.x0}&y0=${spec.y0}&width=${spec.width}&height=${spec.height}&resolution=${spec.resolution}`;
+    const promise = new Promise((resolve, reject) => {
+      new THREE.TextureLoader().load(
+        url,
+        (texture) => {
+          if (THREE.SRGBColorSpace) texture.colorSpace = THREE.SRGBColorSpace;
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          state.overlayTextureCache.set(key, texture);
+          resolve({ texture, spec });
+        },
+        undefined,
+        reject,
+      );
+    }).finally(() => {
+      state.pendingOverlayRequests.delete(key);
+    });
+
+    state.pendingOverlayRequests.set(key, promise);
+    return promise;
+  }
+
   function sampleHeight(terrain, x, y) {
     const gx = Math.max(
       0,
@@ -273,6 +319,29 @@
     return 1;
   }
 
+  function terrainCoversCurrentView(data) {
+    const terrain = data.terrain;
+    const center = viewCenter();
+    const radius = viewRadius();
+    const pad = Math.max(terrain.dx, terrain.dy) * 2;
+    const minX = terrain.x0;
+    const minY = terrain.y0;
+    const maxX = terrain.x0 + (terrain.width - 1) * terrain.dx;
+    const maxY = terrain.y0 + (terrain.height - 1) * terrain.dy;
+    return (
+      center[0] - radius >= minX - pad &&
+      center[0] + radius <= maxX + pad &&
+      center[1] - radius >= minY - pad &&
+      center[1] + radius <= maxY + pad
+    );
+  }
+
+  function useOverviewIfCurrentTerrainIsTooSmall() {
+    if (!state.data || state.data.preview || terrainCoversCurrentView(state.data)) return;
+    const preview = overviewFor(state.focusIndex, viewRadius());
+    if (preview) state.data = preview;
+  }
+
   function resetScene(container) {
     console.log("[terrain] reset scene", {
       width: container.clientWidth,
@@ -285,6 +354,7 @@
 
     state.scene = new THREE.Scene();
     state.scene.background = null;
+    state.overlayRoot = null;
     state.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     state.renderer.shadowMap.enabled = true;
     state.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -370,6 +440,81 @@
     });
   }
 
+  function overlayCoversCurrentView(spec) {
+    const center = viewCenter();
+    const radius = viewRadius();
+    const pad = spec.resolution * 2;
+    const maxX = spec.x0 + (spec.width - 1) * spec.resolution;
+    const maxY = spec.y0 + (spec.height - 1) * spec.resolution;
+    return (
+      center[0] - radius >= spec.x0 - pad &&
+      center[0] + radius <= maxX + pad &&
+      center[1] - radius >= spec.y0 - pad &&
+      center[1] + radius <= maxY + pad
+    );
+  }
+
+  function overlayRootFor(data, terrainGeometry, overlay) {
+    const center = viewCenter();
+    const geometry = terrainGeometry.clone();
+    const positions = geometry.attributes.position.array;
+    const uvs = new Float32Array((positions.length / 3) * 2);
+    const widthM = Math.max(1, (overlay.spec.width - 1) * overlay.spec.resolution);
+    const heightM = Math.max(1, (overlay.spec.height - 1) * overlay.spec.resolution);
+
+    for (let i = 0, j = 0; i < positions.length; i += 3, j += 2) {
+      const worldX = positions[i] + center[0];
+      const worldY = center[1] - positions[i + 2];
+      positions[i + 1] += 0.8;
+      uvs[j] = (worldX - overlay.spec.x0) / widthM;
+      uvs[j + 1] = (worldY - overlay.spec.y0) / heightM;
+    }
+
+    geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+    geometry.attributes.position.needsUpdate = true;
+
+    const material = new THREE.MeshBasicMaterial({
+      map: overlay.texture,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const root = new THREE.Group();
+    root.add(new THREE.Mesh(geometry, material));
+    return root;
+  }
+
+  function replaceOverlayRoot(root) {
+    if (state.overlayRoot) state.scene.remove(state.overlayRoot);
+    state.overlayRoot = root;
+    if (root) state.scene.add(root);
+  }
+
+  function addTerrainOverlay(data, terrainGeometry) {
+    if (data.preview) {
+      replaceOverlayRoot(null);
+      return;
+    }
+
+    if (state.activeOverlay && overlayCoversCurrentView(state.activeOverlay.spec)) {
+      replaceOverlayRoot(overlayRootFor(data, terrainGeometry, state.activeOverlay));
+    } else {
+      replaceOverlayRoot(null);
+    }
+
+    const root = state.root;
+    ensureOverlayTexture(data.terrain)
+      .then((overlay) => {
+        if (state.root !== root || state.data !== data) return;
+        state.activeOverlay = overlay;
+        replaceOverlayRoot(overlayRootFor(data, terrainGeometry, overlay));
+        setCamera(state.viewMode);
+      })
+      .catch((error) => {
+        console.warn("[terrain] overlay texture failed", error);
+      });
+  }
+
   function buildTerrain(data) {
     console.time("[terrain] build terrain mesh");
     const terrain = data.terrain;
@@ -378,9 +523,12 @@
     const baseHeight = 0;
     const stride = meshStride(terrain, radius);
     const positions = [];
+    const uvs = [];
     const sampledWidth = Math.ceil(terrain.width / stride);
     const sampledHeight = Math.ceil(terrain.height / stride);
     const indexByGrid = new Int32Array(sampledWidth * sampledHeight).fill(-1);
+    const uvWidth = Math.max(1, (terrain.width - 1) * terrain.dx);
+    const uvHeight = Math.max(1, (terrain.height - 1) * terrain.dy);
 
     for (let iy = 0; iy < terrain.height; iy += stride) {
       const y = terrain.y0 + iy * terrain.dy;
@@ -395,6 +543,7 @@
         const sx = Math.floor(ix / stride);
         indexByGrid[sy * sampledWidth + sx] = positions.length / 3;
         positions.push(localX(x, center), z, localY(y, center));
+        uvs.push((x - terrain.x0) / uvWidth, (y - terrain.y0) / uvHeight);
       }
     }
 
@@ -416,6 +565,7 @@
       new THREE.Float32BufferAttribute(positions, 3),
     );
     geometry.setIndex(indices);
+    geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
     geometry.computeVertexNormals();
 
     // Slope-based coloring: flat (warm white) → steep (light blue)
@@ -445,6 +595,7 @@
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     state.root.add(mesh);
+    addTerrainOverlay(data, geometry);
 
     buildEdgeFill(data);
     buildCylinderWall(data, baseHeight);
@@ -801,6 +952,7 @@
 
   function rebuildGeometry() {
     if (!state.scene || !state.data) return;
+    useOverviewIfCurrentTerrainIsTooSmall();
     const start = performance.now();
     if (state.root) {
       state.scene.remove(state.root);
@@ -823,6 +975,22 @@
       radius: Math.round(radius),
       resolution: state.data.resolution,
     });
+  }
+
+  function showTerrainData(data, viewMode) {
+    if (!state.scene || !state.renderer || !state.camera) {
+      render(data, viewMode);
+      return;
+    }
+
+    state.data = data;
+    state.viewMode = viewMode;
+    state.focusIndex = data.focusIndex ?? state.focusIndex;
+    state.maxCutoutRadius = data.maxRadius ?? state.maxCutoutRadius;
+    state.minCutoutRadius = data.minRadius ?? state.minCutoutRadius;
+    state.cutoutRadius = data.circle.radius;
+    updateSunLight(state.focusIndex);
+    rebuildGeometry();
   }
 
   function requestTerrain() {
@@ -853,14 +1021,14 @@
     if (availableTiles.length === 0 && !state.data) {
       const preview = overviewFor(index, radius);
       if (preview) {
-        render(preview, state.viewMode);
+        showTerrainData(preview, state.viewMode);
         setStatus(`Preview while loading ${tiles.length} terrain tiles...`);
       }
     }
 
     if (missingTiles.length === 0) {
       if (availableTiles.length > 0) {
-        render(
+        showTerrainData(
           assembleTerrainFromTiles(availableTiles, circle, index, resolution),
           state.viewMode,
         );
@@ -885,7 +1053,7 @@
           state.tileCache.has(tileKey(tile)),
         );
         if (updatedTiles.length > 0) {
-          render(
+          showTerrainData(
             assembleTerrainFromTiles(updatedTiles, circle, index, resolution),
             state.viewMode,
           );
