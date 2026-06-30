@@ -199,5 +199,17 @@ class FlightCollection:
                 return path
         return None
 
+    def path_for_label(self, label: str) -> Path | None:
+        try:
+            path = (PROJECT_ROOT / label).resolve()
+            path.relative_to(PROJECT_ROOT.resolve())
+        except ValueError:
+            return None
+        if path not in [p.resolve() for p in self.paths]:
+            return None
+        if (path.parent / "ignore").exists():
+            return None
+        return path
+
     def load(self, path: str | Path) -> Flight:
         return load_flight(path)

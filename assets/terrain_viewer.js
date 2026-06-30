@@ -1,12 +1,30 @@
 (() => {
   console.log("[terrain] terrain_viewer.js loaded");
 
+  const COLORS = {
+    slopeFlat: 0xfcf8f3,
+    slopeSteep: 0xb8d0f0,
+    path: 0x111827,
+    marker: 0xf97316,
+    rim: 0xdbe7f3,
+    wallTop: [0x52 / 255, 0x45 / 255, 0x2e / 255],
+    wallBottom: [0x21 / 255, 0x1a / 255, 0x14 / 255],
+    contour: 0x111827,
+  };
+  const SLOPE_MAX_RADIANS = Math.PI / 2;
+  const SLOPE_GAMMA = 0.8;
+  const CONTOUR_INTERVAL_M = 100;
+  const CONTOUR_OPACITY = 0.16;
+  const CONTOUR_LIFT_M = 1.5;
+  const IDLE_REFINE_DELAY_MS = 500;
+
   const state = {
     renderer: null,
     scene: null,
     camera: null,
     root: null,
     overlayRoot: null,
+    currentMarker: null,
     data: null,
     meta: null,
     overviewData: null,
@@ -22,6 +40,12 @@
     overlayTextureCache: new Map(),
     pendingOverlayRequests: new Map(),
     activeOverlay: null,
+    wallTexture: null,
+    flightOptions: null,
+    flightLabel: null,
+    loadingFlight: false,
+    qualityMode: "idle",
+    idleTimer: null,
     azimuth: Math.PI / 4,
     dragging: false,
     dragStartX: 0,
@@ -30,6 +54,7 @@
     dragInstalled: false,
     scrubInstalled: false,
     focusIndex: 0,
+    centerIndex: 0,
     directionalLight: null,
     cutoutRadius: 1200,
     minCutoutRadius: 450,
@@ -58,7 +83,7 @@
   function viewCenter() {
     const point =
       state.data.flightPath[
-        Math.min(state.focusIndex, state.data.flightPath.length - 1)
+        Math.min(state.centerIndex, state.data.flightPath.length - 1)
       ];
     return clampedCenterFor(point, viewRadius());
   }
@@ -84,11 +109,11 @@
     ];
   }
 
-  function overviewFor(index, radius) {
+  function overviewFor(centerIndex, radius) {
     if (!state.overviewData || !state.meta) return null;
     const point =
       state.meta.flightPath[
-        Math.max(0, Math.min(state.meta.flightPath.length - 1, index))
+        Math.max(0, Math.min(state.meta.flightPath.length - 1, centerIndex))
       ];
     return {
       ...state.overviewData,
@@ -98,7 +123,8 @@
       },
       fullCircle: state.meta.fullCircle,
       flightPath: state.meta.flightPath,
-      focusIndex: index,
+      focusIndex: state.focusIndex,
+      centerIndex,
       minRadius: state.minCutoutRadius,
       maxRadius: state.maxCutoutRadius,
       resolution: state.overviewData.resolution,
@@ -106,11 +132,23 @@
     };
   }
 
-  function lodForRadius(radius) {
+  function baseLodForRadius(radius) {
     if (radius >= 10000) return { tileSize: 10000, resolution: 50 };
     if (radius >= 5000) return { tileSize: 5000, resolution: 25 };
     if (radius >= 2500) return { tileSize: 2000, resolution: 10 };
     return { tileSize: 1000, resolution: 5 };
+  }
+
+  function coarserLod(lod) {
+    if (lod.resolution <= 5) return { tileSize: 2000, resolution: 10 };
+    if (lod.resolution <= 10) return { tileSize: 5000, resolution: 25 };
+    if (lod.resolution <= 25) return { tileSize: 10000, resolution: 50 };
+    return lod;
+  }
+
+  function lodForRadius(radius, qualityMode = state.qualityMode) {
+    const lod = baseLodForRadius(radius);
+    return qualityMode === "interactive" ? coarserLod(lod) : lod;
   }
 
   function tileKey(tile) {
@@ -142,7 +180,7 @@
     return tiles;
   }
 
-  function assembleTerrainFromTiles(tiles, circle, focusIndex, resolution) {
+  function assembleTerrainFromTiles(tiles, circle, focusIndex, centerIndex, resolution) {
     const tilePayloads = tiles.map(
       (tile) => state.tileCache.get(tileKey(tile)).tile,
     );
@@ -202,6 +240,7 @@
       flightPath: state.meta.flightPath,
       sun: state.meta.sun,
       focusIndex,
+      centerIndex,
       resolution,
       minRadius: state.minCutoutRadius,
       maxRadius: state.maxCutoutRadius,
@@ -310,13 +349,67 @@
     );
   }
 
+  function applySlopeColors(geometry) {
+    const normals = geometry.attributes.normal.array;
+    const flatColor = COLORS.slopeFlat,
+      steepColor = COLORS.slopeSteep;
+    const fr = ((flatColor >> 16) & 0xff) / 255,
+      fg = ((flatColor >> 8) & 0xff) / 255,
+      fb = (flatColor & 0xff) / 255;
+    const sr = ((steepColor >> 16) & 0xff) / 255,
+      sg = ((steepColor >> 8) & 0xff) / 255,
+      sb = (steepColor & 0xff) / 255;
+    const colors = new Float32Array(normals.length);
+    for (let i = 0; i < normals.length; i += 3) {
+      const ny = -1 * normals[i + 1];
+      const slopeRadians = Math.acos(THREE.MathUtils.clamp(ny, 0, 1));
+      const t = Math.pow(
+        THREE.MathUtils.clamp(slopeRadians / SLOPE_MAX_RADIANS, 0, 1),
+        SLOPE_GAMMA,
+      );
+      colors[i] = THREE.MathUtils.lerp(fr, sr, t);
+      colors[i + 1] = THREE.MathUtils.lerp(fg, sg, t);
+      colors[i + 2] = THREE.MathUtils.lerp(fb, sb, t);
+    }
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  }
+
+  function wallGrainTexture() {
+    if (state.wallTexture) return state.wallTexture;
+    const size = 96;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    const image = ctx.createImageData(size, size);
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const i = (y * size + x) * 4;
+        const grain = 175 + Math.random() * 70 + Math.sin((x + y * 0.35) * 0.55) * 10;
+        image.data[i] = grain;
+        image.data[i + 1] = grain;
+        image.data[i + 2] = grain;
+        image.data[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.minFilter = THREE.LinearMipmapLinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    state.wallTexture = texture;
+    return texture;
+  }
+
   function meshStride(terrain, radius) {
     const estimatedVertices =
       (Math.PI * radius * radius) / Math.max(1, terrain.dx * terrain.dy);
-    if (estimatedVertices > 600000) return 4;
-    if (estimatedVertices > 300000) return 3;
-    if (estimatedVertices > 120000) return 2;
-    return 1;
+    let stride = 1;
+    if (estimatedVertices > 600000) stride = 4;
+    else if (estimatedVertices > 300000) stride = 3;
+    else if (estimatedVertices > 120000) stride = 2;
+    return state.qualityMode === "interactive" ? stride + 1 : stride;
   }
 
   function terrainCoversCurrentView(data) {
@@ -338,8 +431,27 @@
 
   function useOverviewIfCurrentTerrainIsTooSmall() {
     if (!state.data || state.data.preview || terrainCoversCurrentView(state.data)) return;
-    const preview = overviewFor(state.focusIndex, viewRadius());
+    const preview = overviewFor(state.centerIndex, viewRadius());
     if (preview) state.data = preview;
+  }
+
+  function enterInteractiveMode(rebuild = true) {
+    window.clearTimeout(state.idleTimer);
+    if (state.qualityMode !== "interactive") {
+      state.qualityMode = "interactive";
+      if (rebuild && state.data) rebuildGeometry();
+    }
+  }
+
+  function scheduleIdleRefine() {
+    window.clearTimeout(state.idleTimer);
+    state.idleTimer = window.setTimeout(() => {
+      if (state.qualityMode !== "idle") {
+        state.qualityMode = "idle";
+        if (state.data) rebuildGeometry();
+      }
+      requestTerrain();
+    }, IDLE_REFINE_DELAY_MS);
   }
 
   function resetScene(container) {
@@ -385,6 +497,7 @@
       state.dragging = true;
       state.dragStartX = event.clientX;
       state.dragStartAzimuth = state.azimuth;
+      enterInteractiveMode(false);
       container.setPointerCapture(event.pointerId);
     });
 
@@ -393,15 +506,18 @@
       const dx = event.clientX - state.dragStartX;
       state.azimuth = state.dragStartAzimuth + dx * 0.008;
       setCamera(state.viewMode);
+      scheduleIdleRefine();
     });
 
     container.addEventListener("pointerup", (event) => {
       state.dragging = false;
       container.releasePointerCapture(event.pointerId);
+      scheduleIdleRefine();
     });
 
     container.addEventListener("pointercancel", () => {
       state.dragging = false;
+      scheduleIdleRefine();
     });
 
     let wheelTimeout = 0;
@@ -409,6 +525,7 @@
       "wheel",
       (event) => {
         event.preventDefault();
+        enterInteractiveMode(false);
         const factor = Math.exp(event.deltaY * 0.0012);
         state.cutoutRadius = Math.max(
           state.minCutoutRadius,
@@ -417,6 +534,7 @@
         if (state.data) rebuildGeometry();
         clearTimeout(wheelTimeout);
         wheelTimeout = setTimeout(() => requestTerrain(), 120);
+        scheduleIdleRefine();
       },
       { passive: false },
     );
@@ -427,16 +545,105 @@
     const scrubber = document.getElementById("scrub");
     const path = state.meta?.flightPath || state.data?.flightPath;
     if (!scrubber || !path) return;
-    state.scrubInstalled = true;
     scrubber.max = String(Math.max(0, path.length - 1));
     scrubber.value = String(state.focusIndex);
+    if (state.scrubInstalled) return;
+    state.scrubInstalled = true;
     scrubber.addEventListener("input", () => {
+      enterInteractiveMode(false);
       state.focusIndex = Number(scrubber.value);
+      state.centerIndex = state.focusIndex;
       updateSunLight(state.focusIndex);
       if (state.data) rebuildGeometry();
       clearTimeout(state.playTimer);
       scheduleNext();
       requestTerrain();
+      scheduleIdleRefine();
+    });
+  }
+
+  function setFlightLabel(label) {
+    state.flightLabel = label;
+    const el = document.getElementById("flight-label");
+    if (el) el.textContent = label || "";
+  }
+
+  function showFlightOptions(list, flights) {
+    list.replaceChildren();
+    for (const flight of flights) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "flight-option";
+      button.textContent = flight.label;
+      button.addEventListener("click", () => selectFlight(flight.value));
+      list.appendChild(button);
+    }
+  }
+
+  async function loadFlightOptions(list) {
+    if (state.flightOptions) {
+      showFlightOptions(list, state.flightOptions);
+      return;
+    }
+    list.textContent = "Loading flights...";
+    const response = await fetch("/flights");
+    if (!response.ok) throw new Error(`flights failed: ${response.status}`);
+    const payload = await response.json();
+    state.flightOptions = payload.flights || [];
+    showFlightOptions(list, state.flightOptions);
+  }
+
+  async function selectFlight(label) {
+    if (state.loadingFlight || label === state.flightLabel) return;
+    state.loadingFlight = true;
+    setStatus(`Loading ${label}...`);
+    try {
+      const response = await fetch(`/flight-payload?flight=${encodeURIComponent(label)}`);
+      if (!response.ok) throw new Error(`flight payload failed: ${response.status}`);
+      const payload = await response.json();
+      clearTimeout(state.playTimer);
+      clearTimeout(state.pendingRequest);
+      state.requestSerial += 1;
+      state.pendingRequest = null;
+      state.activeOverlay = null;
+      replaceOverlayRoot(null);
+      state.meta = payload.metadata;
+      state.overviewData = payload.overview;
+      state.focusIndex = 0;
+      state.centerIndex = 0;
+      state.minCutoutRadius = state.meta.minRadius;
+      state.maxCutoutRadius = state.meta.maxRadius;
+      state.cutoutRadius = state.maxCutoutRadius;
+      setFlightLabel(payload.label);
+      installScrubber();
+      const list = document.getElementById("flight-picker-list");
+      if (list) list.classList.remove("open");
+      const preview = overviewFor(0, state.maxCutoutRadius);
+      if (preview) {
+        render(preview, state.viewMode);
+        scheduleNext();
+      }
+    } catch (error) {
+      console.warn("[terrain] flight switch failed", error);
+      setStatus(`Could not load ${label}`);
+    } finally {
+      state.loadingFlight = false;
+    }
+  }
+
+  function installFlightPicker() {
+    const button = document.getElementById("flight-picker-button");
+    const list = document.getElementById("flight-picker-list");
+    if (!button || !list) return;
+    button.addEventListener("click", async () => {
+      list.classList.toggle("open");
+      if (!list.classList.contains("open")) return;
+      try {
+        await loadFlightOptions(list);
+      } catch (error) {
+        console.warn("[terrain] flight list failed", error);
+        list.textContent = "Could not load flights";
+      }
     });
   }
 
@@ -567,26 +774,7 @@
     geometry.setIndex(indices);
     geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
     geometry.computeVertexNormals();
-
-    // Slope-based coloring: flat (warm white) → steep (light blue)
-    const normals = geometry.attributes.normal.array;
-    const flatColor = 0xfff8f0,
-      steepColor = 0xb8d0f0;
-    const fr = ((flatColor >> 16) & 0xff) / 255,
-      fg = ((flatColor >> 8) & 0xff) / 255,
-      fb = (flatColor & 0xff) / 255;
-    const sr = ((steepColor >> 16) & 0xff) / 255,
-      sg = ((steepColor >> 8) & 0xff) / 255,
-      sb = (steepColor & 0xff) / 255;
-    const colors = new Float32Array(normals.length);
-    for (let i = 0; i < normals.length; i += 3) {
-      const ny = -1 * normals[i + 1];
-      const t = Math.pow(1 - THREE.MathUtils.clamp(ny, 0, 1), 0.6);
-      colors[i] = THREE.MathUtils.lerp(fr, sr, t);
-      colors[i + 1] = THREE.MathUtils.lerp(fg, sg, t);
-      colors[i + 2] = THREE.MathUtils.lerp(fb, sb, t);
-    }
-    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    applySlopeColors(geometry);
 
     const material = new THREE.MeshLambertMaterial({
       vertexColors: true,
@@ -598,6 +786,7 @@
     addTerrainOverlay(data, geometry);
 
     buildEdgeFill(data);
+    buildContourLines(data);
     buildCylinderWall(data, baseHeight);
     console.timeEnd("[terrain] build terrain mesh");
     console.log("[terrain] terrain mesh ready", {
@@ -626,7 +815,7 @@
         const x = center[0] + Math.cos(angle) * r;
         const y = center[1] + Math.sin(angle) * r;
         const z = sampleHeight(terrain, x, y);
-        positions.push(localX(x, center), z + 1, localY(y, center));
+        positions.push(localX(x, center), z + 0.2, localY(y, center));
       }
     }
 
@@ -645,14 +834,92 @@
     );
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
+    applySlopeColors(geometry);
     const material = new THREE.MeshLambertMaterial({
-      color: 0xc8c0b0,
+      vertexColors: true,
       side: THREE.DoubleSide,
     });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     state.root.add(mesh);
     console.timeEnd("[terrain] build edge fill");
+  }
+
+  function contourPoint(x, y, level, center) {
+    return [localX(x, center), level + CONTOUR_LIFT_M, localY(y, center)];
+  }
+
+  function maybeContourEdge(points, level, a, b, ax, ay, bx, by, center) {
+    if (a === b) return;
+    const crosses = (a < level && b >= level) || (b < level && a >= level);
+    if (!crosses) return;
+    const t = (level - a) / (b - a);
+    points.push(contourPoint(ax + (bx - ax) * t, ay + (by - ay) * t, level, center));
+  }
+
+  function buildContourLines(data) {
+    if (state.qualityMode === "interactive") return;
+    console.time("[terrain] build contour lines");
+    const terrain = data.terrain;
+    const center = viewCenter();
+    const radius = viewRadius();
+    const stride = meshStride(terrain, radius);
+    const minLevel = Math.ceil(terrain.zMin / CONTOUR_INTERVAL_M) * CONTOUR_INTERVAL_M;
+    const maxLevel = Math.floor(terrain.zMax / CONTOUR_INTERVAL_M) * CONTOUR_INTERVAL_M;
+    const positions = [];
+
+    for (let level = minLevel; level <= maxLevel; level += CONTOUR_INTERVAL_M) {
+      for (let iy = 0; iy < terrain.height - stride; iy += stride) {
+        const y0 = terrain.y0 + iy * terrain.dy;
+        const y1 = terrain.y0 + (iy + stride) * terrain.dy;
+        for (let ix = 0; ix < terrain.width - stride; ix += stride) {
+          const x0 = terrain.x0 + ix * terrain.dx;
+          const x1 = terrain.x0 + (ix + stride) * terrain.dx;
+          const cx = (x0 + x1) / 2;
+          const cy = (y0 + y1) / 2;
+          const dx = cx - center[0];
+          const dy = cy - center[1];
+          if (dx * dx + dy * dy > radius * radius) continue;
+
+          const z00 = terrain.z[iy * terrain.width + ix];
+          const z10 = terrain.z[iy * terrain.width + ix + stride];
+          const z01 = terrain.z[(iy + stride) * terrain.width + ix];
+          const z11 = terrain.z[(iy + stride) * terrain.width + ix + stride];
+          const cellMin = Math.min(z00, z10, z01, z11);
+          const cellMax = Math.max(z00, z10, z01, z11);
+          if (level < cellMin || level > cellMax) continue;
+
+          const points = [];
+          maybeContourEdge(points, level, z00, z10, x0, y0, x1, y0, center);
+          maybeContourEdge(points, level, z10, z11, x1, y0, x1, y1, center);
+          maybeContourEdge(points, level, z01, z11, x0, y1, x1, y1, center);
+          maybeContourEdge(points, level, z00, z01, x0, y0, x0, y1, center);
+
+          if (points.length === 2) {
+            positions.push(...points[0], ...points[1]);
+          } else if (points.length === 4) {
+            positions.push(...points[0], ...points[1], ...points[2], ...points[3]);
+          }
+        }
+      }
+    }
+
+    if (positions.length === 0) {
+      console.timeEnd("[terrain] build contour lines");
+      return;
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    const material = new THREE.LineBasicMaterial({
+      color: COLORS.contour,
+      transparent: true,
+      opacity: CONTOUR_OPACITY,
+      depthWrite: false,
+    });
+    const lines = new THREE.LineSegments(geometry, material);
+    lines.renderOrder = 2;
+    state.root.add(lines);
+    console.timeEnd("[terrain] build contour lines");
   }
 
   function buildCylinderWall(data, baseHeight) {
@@ -663,7 +930,9 @@
     const segments = 192;
     const positions = [];
     const colors = [];
+    const uvs = [];
     const indices = [];
+    const repeatU = Math.max(8, Math.round((2 * Math.PI * radius) / 350));
 
     for (let i = 0; i <= segments; i += 1) {
       const angle = (i / segments) * Math.PI * 2;
@@ -672,7 +941,9 @@
       const z = sampleHeight(terrain, x, y);
       positions.push(localX(x, center), z, localY(y, center));
       positions.push(localX(x, center), baseHeight, localY(y, center));
-      colors.push(0.32, 0.27, 0.18, 0.13, 0.1, 0.08);
+      colors.push(...COLORS.wallTop, ...COLORS.wallBottom);
+      uvs.push((i / segments) * repeatU, (z - baseHeight) / 280);
+      uvs.push((i / segments) * repeatU, 0);
     }
 
     for (let i = 0; i < segments; i += 1) {
@@ -689,9 +960,11 @@
       new THREE.Float32BufferAttribute(positions, 3),
     );
     geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
     const material = new THREE.MeshLambertMaterial({
+      map: wallGrainTexture(),
       vertexColors: true,
       side: THREE.DoubleSide,
     });
@@ -746,6 +1019,26 @@
     return new THREE.Line(geometry, material);
   }
 
+  function updateCurrentMarker(render = true) {
+    if (!state.currentMarker || !state.data) return false;
+    const center = viewCenter();
+    const radius = viewRadius();
+    const focusPoint =
+      state.data.flightPath[Math.min(state.focusIndex, state.data.flightPath.length - 1)];
+    const dx = focusPoint[0] - center[0];
+    const dy = focusPoint[1] - center[1];
+    state.currentMarker.visible = dx * dx + dy * dy <= radius * radius;
+    state.currentMarker.position.set(
+      localX(focusPoint[0], center),
+      focusPoint[2] + 54,
+      localY(focusPoint[1], center),
+    );
+    if (render && state.renderer && state.scene && state.camera) {
+      state.renderer.render(state.scene, state.camera);
+    }
+    return true;
+  }
+
   function buildOverlays(data) {
     console.time("[terrain] build overlays");
     const center = viewCenter();
@@ -787,26 +1080,21 @@
         new THREE.Mesh(
           tubeGeo,
           new THREE.MeshBasicMaterial({
-            color: 0xffffff,
+            color: COLORS.path,
             transparent: true,
-            opacity: 0.8,
+            opacity: 0.85,
           }),
         ),
       );
     }
 
-    const focusPoint =
-      data.flightPath[Math.min(state.focusIndex, data.flightPath.length - 1)];
     const marker = new THREE.Mesh(
       new THREE.SphereGeometry(Math.max(18, circleRadius * 0.018), 24, 12),
-      new THREE.MeshBasicMaterial({ color: 0xf97316 }),
+      new THREE.MeshBasicMaterial({ color: COLORS.marker }),
     );
-    marker.position.set(
-      localX(focusPoint[0], center),
-      focusPoint[2] + topLift + 28,
-      localY(focusPoint[1], center),
-    );
+    state.currentMarker = marker;
     state.root.add(marker);
+    updateCurrentMarker(false);
 
     const rim = [];
     for (let i = 0; i <= 192; i += 1) {
@@ -821,7 +1109,7 @@
         ),
       );
     }
-    state.root.add(buildLine(rim, 0xdde7f3, 1));
+    state.root.add(buildLine(rim, COLORS.rim, 1));
 
     const start = mapAngleFromAzimuth(data.sun.startAzimuth);
     let end = mapAngleFromAzimuth(data.sun.endAzimuth);
@@ -879,7 +1167,10 @@
       const scrubber = document.getElementById("scrub");
       if (scrubber) scrubber.value = state.focusIndex;
       updateSunLight(state.focusIndex);
-      if (state.data) rebuildGeometry();
+      if (state.data && !updateCurrentMarker()) rebuildGeometry();
+      setStatus(
+        `${state.data?.preview ? "Preview" : "Cutout"} ${Math.round(viewRadius())} m · point ${state.focusIndex + 1}/${state.meta.flightPath.length}`,
+      );
       scheduleNext();
     }, dt);
   }
@@ -957,6 +1248,7 @@
     if (state.root) {
       state.scene.remove(state.root);
     }
+    state.currentMarker = null;
     state.root = new THREE.Group();
     state.scene.add(state.root);
 
@@ -986,6 +1278,7 @@
     state.data = data;
     state.viewMode = viewMode;
     state.focusIndex = data.focusIndex ?? state.focusIndex;
+    state.centerIndex = data.centerIndex ?? state.centerIndex;
     state.maxCutoutRadius = data.maxRadius ?? state.maxCutoutRadius;
     state.minCutoutRadius = data.minRadius ?? state.minCutoutRadius;
     state.cutoutRadius = data.circle.radius;
@@ -1003,8 +1296,12 @@
       0,
       Math.min(state.meta.flightPath.length - 1, state.focusIndex),
     );
-    const focusPoint = state.meta.flightPath[index];
-    const center = clampedCenterFor(focusPoint, radius);
+    const centerIndex = Math.max(
+      0,
+      Math.min(state.meta.flightPath.length - 1, state.centerIndex),
+    );
+    const centerPoint = state.meta.flightPath[centerIndex];
+    const center = clampedCenterFor(centerPoint, radius);
     const circle = { center, radius };
     const lod = lodForRadius(radius);
     const resolution = lod.resolution;
@@ -1019,7 +1316,7 @@
       state.tileCache.has(tileKey(tile)),
     );
     if (availableTiles.length === 0 && !state.data) {
-      const preview = overviewFor(index, radius);
+      const preview = overviewFor(centerIndex, radius);
       if (preview) {
         showTerrainData(preview, state.viewMode);
         setStatus(`Preview while loading ${tiles.length} terrain tiles...`);
@@ -1029,7 +1326,7 @@
     if (missingTiles.length === 0) {
       if (availableTiles.length > 0) {
         showTerrainData(
-          assembleTerrainFromTiles(availableTiles, circle, index, resolution),
+          assembleTerrainFromTiles(availableTiles, circle, index, centerIndex, resolution),
           state.viewMode,
         );
       }
@@ -1054,7 +1351,7 @@
         );
         if (updatedTiles.length > 0) {
           showTerrainData(
-            assembleTerrainFromTiles(updatedTiles, circle, index, resolution),
+            assembleTerrainFromTiles(updatedTiles, circle, index, centerIndex, resolution),
             state.viewMode,
           );
         }
@@ -1109,6 +1406,7 @@
     state.data = data;
     state.viewMode = viewMode;
     state.focusIndex = data.focusIndex ?? state.focusIndex;
+    state.centerIndex = data.centerIndex ?? state.centerIndex;
     state.maxCutoutRadius = data.maxRadius ?? state.maxCutoutRadius;
     state.minCutoutRadius = data.minRadius ?? state.minCutoutRadius;
     state.cutoutRadius = data.circle.radius;
@@ -1133,10 +1431,12 @@
       state.meta = window.TERRAIN_META;
       state.overviewData = window.TERRAIN_OVERVIEW || null;
       state.viewMode = window.TERRAIN_VIEW_MODE || "isometric";
+      setFlightLabel(window.TERRAIN_FLIGHT_LABEL || "");
       state.minCutoutRadius = state.meta.minRadius;
       state.maxCutoutRadius = state.meta.maxRadius;
       state.cutoutRadius = state.maxCutoutRadius;
       state.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10000, 50000);
+      installFlightPicker();
       installScrubber();
       // Show overview immediately so first interaction is instant
       const preview = overviewFor(0, state.maxCutoutRadius);

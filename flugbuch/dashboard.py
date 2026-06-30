@@ -21,19 +21,22 @@ OVERVIEW_PAYLOAD_GRID_SIDE = 220
 MIN_RADIUS = 1500
 
 
-@lru_cache(maxsize=1)
-def test_flight_path() -> tuple[Path, str]:
+@lru_cache(maxsize=32)
+def test_flight_path(label: str | None = None) -> tuple[Path, str]:
     collection = FlightCollection()
-    path = collection.latest_valid_path()
+    if label is None:
+        path = collection.latest_valid_path()
+    else:
+        path = collection.path_for_label(label)
     if path is None:
-        raise ValueError("Need at least one valid flight for the WebGL test page.")
+        raise ValueError("Need at least one valid flight for the WebGL test page." if label is None else f"Unknown flight {label}")
 
     return path, path.relative_to(PROJECT_ROOT).as_posix()
 
 
-@lru_cache(maxsize=1)
-def test_flight():
-    path, label = test_flight_path()
+@lru_cache(maxsize=32)
+def test_flight(label: str | None = None):
+    path, label = test_flight_path(label)
     print(f"[terrain] test flight {path}", flush=True)
     flight = load_flight(path)
     return flight, label
@@ -56,10 +59,10 @@ def overview_cache_path(path: Path) -> Path:
     return OVERVIEW_CACHE_DIR / f"{key}.jsonl"
 
 
-@lru_cache(maxsize=1)
-def flight_page_payload() -> tuple[str, str, str]:
+@lru_cache(maxsize=32)
+def flight_page_payload(label: str | None = None) -> tuple[str, str, str]:
     start = perf_counter()
-    path, label = test_flight_path()
+    path, label = test_flight_path(label)
     cached_path = overview_cache_path(path)
     try:
         with cached_path.open("rt", encoding="utf-8") as f:
@@ -80,7 +83,7 @@ def flight_page_payload() -> tuple[str, str, str]:
 
     print(f"[terrain] overview cache MISS {cached_path.name}", flush=True)
     flight_start = perf_counter()
-    flight, label = test_flight()
+    flight, label = test_flight(label)
     flight_ms = (perf_counter() - flight_start) * 1000
     center, radius = full_flight_circle(flight.xy)
     overview_start = perf_counter()
@@ -140,6 +143,15 @@ def flight_page_payload() -> tuple[str, str, str]:
     return metadata_json, overview_json, label
 
 
+@lru_cache(maxsize=1)
+def flight_options() -> list[dict[str, str]]:
+    collection = FlightCollection()
+    return [
+        {"label": path.relative_to(PROJECT_ROOT).as_posix(), "value": path.relative_to(PROJECT_ROOT).as_posix()}
+        for path in collection.valid_paths()
+    ]
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -151,7 +163,7 @@ def create_app() -> Flask:
     def terrain() -> Response:
         start = perf_counter()
         flight_start = perf_counter()
-        flight, _label = test_flight()
+        flight, _label = test_flight(request.args.get("flight"))
         flight_ms = (perf_counter() - flight_start) * 1000
         index = int(request.args.get("index", 0))
         radius = float(request.args.get("radius", 1500))
@@ -169,6 +181,20 @@ def create_app() -> Flask:
             flush=True,
         )
         return response
+
+    @app.get("/flights")
+    def flights() -> Response:
+        return jsonify({"flights": flight_options()})
+
+    @app.get("/flight-payload")
+    def flight_payload() -> Response:
+        label = request.args.get("flight")
+        try:
+            metadata_json, overview_json, flight_label = flight_page_payload(label)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+        body = f'{{"label":{json.dumps(flight_label, separators=(",", ":"))},"metadata":{metadata_json},"overview":{overview_json}}}'
+        return Response(body, mimetype="application/json")
 
     @app.get("/terrain-tile")
     def terrain_tile() -> Response:
@@ -240,6 +266,12 @@ def create_app() -> Flask:
                     #terrain-viewer {{ position: fixed; inset: 0; }}
                     #terrain-viewer canvas {{ display: block; width: 100%; height: 100%; }}
                     #terrain-status {{ position: fixed; top: 14px; left: 16px; z-index: 2; color: #e5e7eb; font-size: 13px; letter-spacing: .02em; }}
+                    #flight-picker {{ position: fixed; top: 40px; left: 16px; z-index: 4; }}
+                    #flight-picker-button {{ color: #e5e7eb; background: rgba(15,23,42,.72); border: 1px solid rgba(148,163,184,.45); border-radius: 8px; padding: 6px 10px; cursor: pointer; }}
+                    #flight-picker-list {{ display: none; width: min(520px, calc(100vw - 32px)); max-height: 55vh; overflow: auto; margin-top: 6px; background: rgba(15,23,42,.9); border: 1px solid rgba(148,163,184,.35); border-radius: 10px; box-shadow: 0 14px 40px rgba(15,23,42,.35); }}
+                    #flight-picker-list.open {{ display: block; }}
+                    .flight-option {{ display: block; width: 100%; border: 0; border-bottom: 1px solid rgba(148,163,184,.18); padding: 8px 10px; color: #e5e7eb; background: transparent; text-align: left; font-size: 12px; cursor: pointer; }}
+                    .flight-option:hover {{ background: rgba(148,163,184,.18); }}
                     #flight-label {{ position: fixed; right: 16px; bottom: 14px; z-index: 2; color: #cbd5e1; font-size: 12px; }}
                     #scrub {{ position: fixed; left: 16px; right: 16px; bottom: 18px; z-index: 3; accent-color: #f59e0b; }}
                     #help {{ position: fixed; top: 14px; right: 16px; z-index: 2; color: #94a3b8; font-size: 12px; }}
@@ -249,12 +281,13 @@ def create_app() -> Flask:
             </head>
             <body>
                 <div id="terrain-status">Loading renderer...</div>
+                <div id="flight-picker"><button id="flight-picker-button" type="button">Flights</button><div id="flight-picker-list"></div></div>
                 <div id="help">drag left/right to rotate · wheel to zoom · scrub along flight</div>
                 <div id="terrain-viewer"></div>
                 <div id="flight-label">{flight_label}</div>
                 <div id="scale"><div id="scale-bar"></div><div>1 km</div></div>
                 <input id="scrub" type="range" min="0" max="0" value="0" step="1">
-                <script>window.TERRAIN_META = {metadata_json}; window.TERRAIN_OVERVIEW = {overview_json}; window.TERRAIN_VIEW_MODE = "isometric";</script>
+                <script>window.TERRAIN_META = {metadata_json}; window.TERRAIN_OVERVIEW = {overview_json}; window.TERRAIN_FLIGHT_LABEL = {json.dumps(flight_label, separators=(",", ":"))}; window.TERRAIN_VIEW_MODE = "isometric";</script>
                 <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
                 <script src="/assets/terrain_viewer.js"></script>
             </body>

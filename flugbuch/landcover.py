@@ -19,8 +19,9 @@ from .terrain import WEBGL_TILE_CACHE_DIR
 
 
 VECTOR_TILE_URL = "https://vectortiles{server}.geo.admin.ch/tiles/ch.swisstopo.base.vt/v1.0.0/{z}/{x}/{y}.pbf"
-WATER_COLOR = (120, 185, 225, 155)
-FOREST_COLOR = (145, 190, 130, 115)
+OVERLAY_STYLE_VERSION = "v2"
+WATER_COLOR = (120, 185, 225, 128)
+FOREST_COLOR = (145, 190, 130, 38)
 FOREST_CLASSES = {"forest", "wood"}
 FOREST_SUBCLASSES = {"forest", "wood", "loose_forest", "scrub", "woody_plant"}
 
@@ -39,7 +40,7 @@ def pick_vector_zoom(resolution_m: float) -> int:
 
 
 def overlay_cache_key(x0: float, y0: float, width: int, height: int, resolution_m: float, zoom: int) -> Path:
-    name = f"overlay_z{zoom}_r{resolution_m:g}_w{width}_h{height}_x{int(x0)}_y{int(y0)}.png"
+    name = f"overlay_{OVERLAY_STYLE_VERSION}_z{zoom}_r{resolution_m:g}_w{width}_h{height}_x{int(x0)}_y{int(y0)}.png"
     return WEBGL_TILE_CACHE_DIR / name
 
 
