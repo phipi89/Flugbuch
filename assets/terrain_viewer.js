@@ -133,16 +133,14 @@
   }
 
   function baseLodForRadius(radius) {
-    if (radius >= 10000) return { tileSize: 10000, resolution: 50 };
-    if (radius >= 5000) return { tileSize: 5000, resolution: 25 };
-    if (radius >= 2500) return { tileSize: 2000, resolution: 10 };
-    return { tileSize: 1000, resolution: 5 };
+    if (radius >= 5000) return { tileSize: 5000, resolution: 18 };
+    if (radius >= 2500) return { tileSize: 2000, resolution: 6 };
+    return { tileSize: 1000, resolution: 2 };
   }
 
   function coarserLod(lod) {
-    if (lod.resolution <= 5) return { tileSize: 2000, resolution: 10 };
-    if (lod.resolution <= 10) return { tileSize: 5000, resolution: 25 };
-    if (lod.resolution <= 25) return { tileSize: 10000, resolution: 50 };
+    if (lod.resolution <= 2) return { tileSize: 2000, resolution: 6 };
+    if (lod.resolution <= 6) return { tileSize: 5000, resolution: 18 };
     return lod;
   }
 
@@ -801,30 +799,38 @@
     const terrain = data.terrain;
     const center = viewCenter();
     const radius = viewRadius();
+    const effectiveSpacing = Math.max(terrain.dx, terrain.dy) * meshStride(terrain, radius);
     const innerRadius = Math.max(
       1,
-      radius - Math.max(terrain.dx, terrain.dy) * 2.2,
+      radius - Math.max(effectiveSpacing * 4.5, Math.max(terrain.dx, terrain.dy) * 3),
     );
     const segments = 256;
+    const rings = 6;
     const positions = [];
     const indices = [];
 
     for (let i = 0; i <= segments; i += 1) {
       const angle = (i / segments) * Math.PI * 2;
-      for (const r of [innerRadius, radius]) {
+      for (let ring = 0; ring < rings; ring += 1) {
+        const t = ring / (rings - 1);
+        const r = THREE.MathUtils.lerp(innerRadius, radius, t);
         const x = center[0] + Math.cos(angle) * r;
         const y = center[1] + Math.sin(angle) * r;
         const z = sampleHeight(terrain, x, y);
-        positions.push(localX(x, center), z + 0.2, localY(y, center));
+        positions.push(localX(x, center), z + 0.08, localY(y, center));
       }
     }
 
     for (let i = 0; i < segments; i += 1) {
-      const inner0 = i * 2;
-      const outer0 = inner0 + 1;
-      const inner1 = inner0 + 2;
-      const outer1 = inner0 + 3;
-      indices.push(inner0, outer0, inner1, inner1, outer0, outer1);
+      const row0 = i * rings;
+      const row1 = (i + 1) * rings;
+      for (let ring = 0; ring < rings - 1; ring += 1) {
+        const inner0 = row0 + ring;
+        const outer0 = inner0 + 1;
+        const inner1 = row1 + ring;
+        const outer1 = inner1 + 1;
+        indices.push(inner0, outer0, inner1, inner1, outer0, outer1);
+      }
     }
 
     const geometry = new THREE.BufferGeometry();
