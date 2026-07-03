@@ -17,6 +17,8 @@
   const CONTOUR_OPACITY = 0.16;
   const CONTOUR_LIFT_M = 1.5;
   const IDLE_REFINE_DELAY_MS = 500;
+  const VIEW_DRAG_DEADZONE_PX = 12;
+  const VIEW_DRAG_THRESHOLD_PX = 90;
 
   const state = {
     renderer: null,
@@ -44,13 +46,25 @@
     flightOptions: null,
     flightLabel: null,
     loadingFlight: false,
+    showLandcover: true,
+    terrainLayer: "slope",
     qualityMode: "idle",
     idleTimer: null,
     azimuth: Math.PI / 4,
     dragging: false,
     dragStartX: 0,
+    dragStartY: 0,
     dragStartAzimuth: 0,
+    dragStartIndex: 0,
+    dragGesture: null,
+    dragStartViewMode: "isometric",
+    dragStartCameraTarget: null,
+    dragPreviewTarget: null,
+    dragTargetViewMode: null,
+    dragViewSettled: false,
+    dragRequestTimer: null,
     viewMode: "isometric",
+    cameraAnimation: null,
     dragInstalled: false,
     scrubInstalled: false,
     focusIndex: 0,
@@ -66,6 +80,32 @@
     const status = document.getElementById("terrain-status");
     if (status) status.textContent = message;
     console.log(`[terrain] ${message}`);
+  }
+
+  function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  }
+
+  function formatSigned(value, digits = 1) {
+    if (!Number.isFinite(value)) return "-";
+    return `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`;
+  }
+
+  function updateInfoPanel() {
+    const meta = state.meta;
+    if (!meta?.flightPath?.length) return;
+    const index = Math.max(0, Math.min(meta.flightPath.length - 1, state.focusIndex));
+    const point = meta.flightPath[index];
+    const asl = point?.[2];
+    const agl = meta.heightAboveGround?.[index];
+    const speedMs = meta.groundSpeedMs?.[index];
+    const varioMs = meta.verticalSpeedMs?.[index];
+
+    setText("info-asl", Number.isFinite(asl) ? `${Math.round(asl)} m` : "-");
+    setText("info-agl", Number.isFinite(agl) ? `${Math.round(agl)} m` : "-");
+    setText("info-speed", Number.isFinite(speedMs) ? `${Math.round(speedMs * 3.6)} km/h` : "-");
+    setText("info-vario", Number.isFinite(varioMs) ? `${formatSigned(varioMs)} m/s` : "-");
   }
 
   function mapAngleFromAzimuth(azimuth) {
@@ -320,6 +360,65 @@
     return promise;
   }
 
+  function terrainTextureSpec(terrain, layer = state.terrainLayer) {
+    if (layer === "slope") return null;
+    const resolution = Math.max(terrain.dx, 2.5);
+    const width = Math.max(1, Math.round((terrain.width - 1) * terrain.dx));
+    const height = Math.max(1, Math.round((terrain.height - 1) * terrain.dy));
+    return { x0: terrain.x0, y0: terrain.y0, width, height, resolution, layer };
+  }
+
+  function terrainTextureKey(spec) {
+    return `${spec.layer}:${spec.x0}:${spec.y0}:${spec.width}:${spec.height}:${spec.resolution}`;
+  }
+
+  function ensureTerrainTexture(terrain, layer = state.terrainLayer) {
+    const spec = terrainTextureSpec(terrain, layer);
+    if (!spec) return Promise.resolve(null);
+    const key = terrainTextureKey(spec);
+    if (state.textureCache.has(key)) return Promise.resolve(state.textureCache.get(key));
+    if (state.pendingTextureRequests.has(key)) return state.pendingTextureRequests.get(key);
+
+    const url = `/terrain-texture?x0=${spec.x0}&y0=${spec.y0}&width=${spec.width}&height=${spec.height}&resolution=${spec.resolution}&layer=${spec.layer}`;
+    const promise = new Promise((resolve, reject) => {
+      new THREE.TextureLoader().load(
+        url,
+        (texture) => {
+          if (THREE.SRGBColorSpace) texture.colorSpace = THREE.SRGBColorSpace;
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          state.textureCache.set(key, texture);
+          resolve(texture);
+        },
+        undefined,
+        reject,
+      );
+    }).finally(() => {
+      state.pendingTextureRequests.delete(key);
+    });
+
+    state.pendingTextureRequests.set(key, promise);
+    return promise;
+  }
+
+  function applyTerrainTexture(data, material, root, layer) {
+    if (layer === "slope") return;
+    ensureTerrainTexture(data.terrain, layer)
+      .then((texture) => {
+        if (!texture || state.root !== root || state.data !== data || state.terrainLayer !== layer) return;
+        material.map = texture;
+        material.vertexColors = false;
+        material.color.setHex(0xffffff);
+        material.needsUpdate = true;
+        if (state.renderer && state.scene && state.camera) {
+          state.renderer.render(state.scene, state.camera);
+        }
+      })
+      .catch((error) => {
+        console.warn("[terrain] terrain texture failed", error);
+      });
+  }
+
   function sampleHeight(terrain, x, y) {
     const gx = Math.max(
       0,
@@ -494,7 +593,19 @@
       if (event.button !== 0) return;
       state.dragging = true;
       state.dragStartX = event.clientX;
+      state.dragStartY = event.clientY;
       state.dragStartAzimuth = state.azimuth;
+      state.dragStartIndex = state.focusIndex;
+      state.dragGesture = null;
+      state.dragStartViewMode = state.viewMode;
+      state.dragStartCameraTarget = cameraTargetFor(state.viewMode);
+      state.dragPreviewTarget = null;
+      state.dragTargetViewMode = null;
+      state.dragViewSettled = false;
+      if (state.cameraAnimation) {
+        cancelAnimationFrame(state.cameraAnimation);
+        state.cameraAnimation = null;
+      }
       enterInteractiveMode(false);
       container.setPointerCapture(event.pointerId);
     });
@@ -502,19 +613,78 @@
     container.addEventListener("pointermove", (event) => {
       if (!state.dragging) return;
       const dx = event.clientX - state.dragStartX;
+      const dy = event.clientY - state.dragStartY;
+      if (!state.dragGesture) {
+        const absX = Math.abs(dx);
+        const absY = Math.abs(dy);
+        if (Math.max(absX, absY) < VIEW_DRAG_DEADZONE_PX) return;
+        state.dragGesture = absY > absX * 1.15 ? "vertical" : "horizontal";
+      }
+
+      if (state.dragGesture === "vertical") {
+        if (state.dragViewSettled) return;
+        previewVerticalViewDrag(dy);
+        const targetMode = verticalDragTargetMode(dy);
+        if (targetMode !== state.dragStartViewMode && Math.abs(dy) >= VIEW_DRAG_THRESHOLD_PX) {
+          state.dragViewSettled = true;
+          finishVerticalViewDrag(dy);
+        }
+        return;
+      }
+
+      if (state.viewMode === "top") {
+        const path = state.meta?.flightPath || state.data?.flightPath;
+        if (!path) return;
+        const nextIndex = Math.max(
+          0,
+          Math.min(path.length - 1, state.dragStartIndex + Math.round(dx / 4)),
+        );
+        if (nextIndex === state.focusIndex) return;
+        state.focusIndex = nextIndex;
+        state.centerIndex = nextIndex;
+        const scrubber = document.getElementById("scrub");
+        if (scrubber) scrubber.value = state.focusIndex;
+        updateSunLight(state.focusIndex);
+        if (state.data) rebuildGeometry();
+        window.clearTimeout(state.dragRequestTimer);
+        state.dragRequestTimer = window.setTimeout(() => requestTerrain(), 90);
+        scheduleIdleRefine();
+        return;
+      }
       state.azimuth = state.dragStartAzimuth + dx * 0.008;
       setCamera(state.viewMode);
       scheduleIdleRefine();
     });
 
     container.addEventListener("pointerup", (event) => {
+      const dy = event.clientY - state.dragStartY;
+      const wasVertical = state.dragGesture === "vertical";
+      const wasSettled = state.dragViewSettled;
       state.dragging = false;
       container.releasePointerCapture(event.pointerId);
+      window.clearTimeout(state.dragRequestTimer);
+      if (wasVertical && !wasSettled) {
+        finishVerticalViewDrag(dy);
+      } else if (!wasVertical && state.viewMode === "top") {
+        requestTerrain();
+      }
+      state.dragGesture = null;
+      state.dragStartCameraTarget = null;
+      state.dragViewSettled = false;
       scheduleIdleRefine();
     });
 
     container.addEventListener("pointercancel", () => {
       state.dragging = false;
+      window.clearTimeout(state.dragRequestTimer);
+      if (state.dragGesture === "vertical" && !state.dragViewSettled) {
+        animateViewMode(state.dragStartViewMode, state.dragPreviewTarget || state.dragStartCameraTarget);
+        setViewModeControl(state.dragStartViewMode);
+      }
+      state.dragGesture = null;
+      state.dragStartCameraTarget = null;
+      state.dragPreviewTarget = null;
+      state.dragViewSettled = false;
       scheduleIdleRefine();
     });
 
@@ -645,6 +815,43 @@
     });
   }
 
+  function installSettingsPanel() {
+    const button = document.getElementById("settings-button");
+    const panel = document.getElementById("settings-panel");
+    const landcover = document.getElementById("settings-landcover");
+    const terrainLayer = document.getElementById("settings-terrain-layer");
+    const viewMode = document.getElementById("settings-view-mode");
+    if (!button || !panel) return;
+
+    if (landcover) landcover.checked = state.showLandcover;
+    if (terrainLayer) terrainLayer.value = state.terrainLayer;
+    if (viewMode) viewMode.value = state.viewMode;
+
+    button.addEventListener("click", () => {
+      panel.classList.toggle("open");
+    });
+
+    landcover?.addEventListener("change", () => {
+      state.showLandcover = landcover.checked;
+      if (!state.showLandcover) replaceOverlayRoot(null);
+      if (state.data) rebuildGeometry();
+    });
+
+    terrainLayer?.addEventListener("change", () => {
+      state.terrainLayer = terrainLayer.value;
+      if (state.terrainLayer !== "slope" && landcover) {
+        state.showLandcover = false;
+        landcover.checked = false;
+        replaceOverlayRoot(null);
+      }
+      if (state.data) rebuildGeometry();
+    });
+
+    viewMode?.addEventListener("change", () => {
+      animateViewMode(viewMode.value);
+    });
+  }
+
   function overlayCoversCurrentView(spec) {
     const center = viewCenter();
     const radius = viewRadius();
@@ -696,7 +903,7 @@
   }
 
   function addTerrainOverlay(data, terrainGeometry) {
-    if (data.preview) {
+    if (data.preview || !state.showLandcover) {
       replaceOverlayRoot(null);
       return;
     }
@@ -710,7 +917,7 @@
     const root = state.root;
     ensureOverlayTexture(data.terrain)
       .then((overlay) => {
-        if (state.root !== root || state.data !== data) return;
+        if (state.root !== root || state.data !== data || !state.showLandcover) return;
         state.activeOverlay = overlay;
         replaceOverlayRoot(overlayRootFor(data, terrainGeometry, overlay));
         setCamera(state.viewMode);
@@ -774,13 +981,17 @@
     geometry.computeVertexNormals();
     applySlopeColors(geometry);
 
+    const textureSpec = terrainTextureSpec(terrain);
+    const cachedTexture = textureSpec ? state.textureCache.get(terrainTextureKey(textureSpec)) : null;
     const material = new THREE.MeshLambertMaterial({
-      vertexColors: true,
+      map: cachedTexture || null,
+      vertexColors: !cachedTexture,
       side: THREE.DoubleSide,
     });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     state.root.add(mesh);
+    applyTerrainTexture(data, material, state.root, state.terrainLayer);
     addTerrainOverlay(data, geometry);
 
     buildEdgeFill(data);
@@ -1042,6 +1253,7 @@
     if (render && state.renderer && state.scene && state.camera) {
       state.renderer.render(state.scene, state.camera);
     }
+    updateInfoPanel();
     return true;
   }
 
@@ -1181,9 +1393,9 @@
     }, dt);
   }
 
-  function setCamera(viewMode) {
+  function cameraTargetFor(viewMode) {
     const container = document.getElementById("terrain-viewer");
-    if (!container || !state.camera || !state.renderer || !state.data) return;
+    if (!container || !state.data) return null;
 
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
@@ -1191,51 +1403,178 @@
     const terrain = state.data.terrain;
     const aspect = width / height;
     const frustum = radius * 2;
-    state.camera.left = (-frustum * aspect) / 2;
-    state.camera.right = (frustum * aspect) / 2;
-    state.camera.top = frustum / 2;
-    state.camera.bottom = -frustum / 2;
-    state.camera.near = -10000;
-    state.camera.far = 50000;
-
     const lookAtY = frustum / 4;
     const directionX = Math.cos(state.azimuth);
     const directionZ = Math.sin(state.azimuth);
+    let position;
+    let up;
+    const lookAt = new THREE.Vector3(0, lookAtY, 0);
     if (viewMode === "isometric") {
       const distance = radius * 1.55;
       const distY =
         terrain.zMax + radius * 1.15 - (terrain.zMin + terrain.zMax) / 2;
-      state.camera.position.set(
+      position = new THREE.Vector3(
         directionX * distance,
         lookAtY + distY,
         directionZ * distance,
       );
-      state.camera.up.set(0, 1, 0);
-      state.camera.lookAt(0, lookAtY, 0);
+      up = new THREE.Vector3(0, 1, 0);
     } else {
       const distY =
         terrain.zMax + radius * 2.2 - (terrain.zMin + terrain.zMax) / 2;
-      state.camera.position.set(0, lookAtY + distY, 0.001);
-      state.camera.up.set(-directionZ, 0, -directionX);
-      state.camera.lookAt(0, lookAtY, 0);
+      position = new THREE.Vector3(0, lookAtY + distY, 0.001);
+      up = new THREE.Vector3(0, 0, -1);
     }
+
+    return {
+      width,
+      height,
+      radius,
+      terrain,
+      left: (-frustum * aspect) / 2,
+      right: (frustum * aspect) / 2,
+      top: frustum / 2,
+      bottom: -frustum / 2,
+      near: -10000,
+      far: 50000,
+      position,
+      up,
+      lookAt,
+      viewMode,
+    };
+  }
+
+  function applyCameraTarget(target) {
+    if (!target || !state.camera || !state.renderer || !state.directionalLight) return;
+    state.camera.left = target.left;
+    state.camera.right = target.right;
+    state.camera.top = target.top;
+    state.camera.bottom = target.bottom;
+    state.camera.near = target.near;
+    state.camera.far = target.far;
+    state.camera.position.copy(target.position);
+    state.camera.up.copy(target.up);
+    state.camera.lookAt(target.lookAt);
     state.camera.updateProjectionMatrix();
 
     // Shadow camera frustum covers the visible terrain circle
     const shadowCam = state.directionalLight.shadow.camera;
-    const pad = radius * 0.1;
-    shadowCam.left = -radius - pad;
-    shadowCam.right = radius + pad;
-    shadowCam.top = radius + pad;
-    shadowCam.bottom = -radius - pad;
-    shadowCam.near = Math.min(terrain.zMin - 500, -500);
-    shadowCam.far = terrain.zMax + 500;
+    const pad = target.radius * 0.1;
+    shadowCam.left = -target.radius - pad;
+    shadowCam.right = target.radius + pad;
+    shadowCam.top = target.radius + pad;
+    shadowCam.bottom = -target.radius - pad;
+    shadowCam.near = Math.min(target.terrain.zMin - 500, -500);
+    shadowCam.far = target.terrain.zMax + 500;
     shadowCam.updateProjectionMatrix();
 
-    state.renderer.setSize(width, height, false);
+    state.renderer.setSize(target.width, target.height, false);
     state.renderer.render(state.scene, state.camera);
-    updateScaleBar(width);
-    console.log("[terrain] rendered frame", { viewMode, width, height });
+    updateScaleBar(target.width);
+  }
+
+  function setCamera(viewMode) {
+    if (!state.camera || !state.renderer || !state.data) return;
+    const target = cameraTargetFor(viewMode);
+    applyCameraTarget(target);
+    console.log("[terrain] rendered frame", { viewMode, width: target?.width, height: target?.height });
+  }
+
+  function blendCameraTargets(start, end, t) {
+    return {
+      ...end,
+      left: THREE.MathUtils.lerp(start.left, end.left, t),
+      right: THREE.MathUtils.lerp(start.right, end.right, t),
+      top: THREE.MathUtils.lerp(start.top, end.top, t),
+      bottom: THREE.MathUtils.lerp(start.bottom, end.bottom, t),
+      position: start.position.clone().lerp(end.position, t),
+      up: start.up.clone().lerp(end.up, t).normalize(),
+      lookAt: start.lookAt.clone().lerp(end.lookAt, t),
+    };
+  }
+
+  function easeInOutCubic(t) {
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  }
+
+  function animateViewMode(viewMode, startTarget = null) {
+    if (!state.camera || !state.renderer || !state.data) {
+      state.viewMode = viewMode;
+      return;
+    }
+    const fromMode = state.viewMode;
+    const start = startTarget || cameraTargetFor(fromMode);
+    if (fromMode === "top" && viewMode === "isometric") {
+      state.azimuth = Math.PI / 2;
+    }
+    state.viewMode = viewMode;
+    const end = cameraTargetFor(viewMode);
+    if (!start || !end) return;
+    if (state.cameraAnimation) cancelAnimationFrame(state.cameraAnimation);
+
+    const startedAt = performance.now();
+    const duration = 450;
+    const frame = (now) => {
+      const t = easeInOutCubic(Math.min(1, (now - startedAt) / duration));
+      applyCameraTarget(blendCameraTargets(start, end, t));
+      if (t < 1) {
+        state.cameraAnimation = requestAnimationFrame(frame);
+      } else {
+        state.cameraAnimation = null;
+        setCamera(state.viewMode);
+      }
+    };
+    state.cameraAnimation = requestAnimationFrame(frame);
+  }
+
+  function setViewModeControl(viewMode) {
+    const select = document.getElementById("settings-view-mode");
+    if (select) select.value = viewMode;
+  }
+
+  function verticalDragTargetMode(dy) {
+    if (state.dragStartViewMode === "isometric" && dy > 0) return "top";
+    if (state.dragStartViewMode === "top" && dy < 0) return "isometric";
+    return state.dragStartViewMode;
+  }
+
+  function viewDragPreviewProgress(dy) {
+    const raw = Math.abs(dy) / VIEW_DRAG_THRESHOLD_PX;
+    if (raw < 1) return Math.min(0.42, Math.pow(raw, 0.8) * 0.42);
+    return Math.min(0.82, 0.55 + (raw - 1) * 0.12);
+  }
+
+  function previewVerticalViewDrag(dy) {
+    const targetMode = verticalDragTargetMode(dy);
+    state.dragTargetViewMode = targetMode;
+    if (targetMode === state.dragStartViewMode) {
+      state.dragPreviewTarget = state.dragStartCameraTarget;
+      applyCameraTarget(state.dragStartCameraTarget);
+      return;
+    }
+    const savedAzimuth = state.azimuth;
+    if (state.dragStartViewMode === "top" && targetMode === "isometric") {
+      state.azimuth = Math.PI / 2;
+    }
+    const end = cameraTargetFor(targetMode);
+    state.azimuth = savedAzimuth;
+    if (!state.dragStartCameraTarget || !end) return;
+    const progress = viewDragPreviewProgress(dy);
+    state.dragPreviewTarget = blendCameraTargets(state.dragStartCameraTarget, end, progress);
+    applyCameraTarget(state.dragPreviewTarget);
+  }
+
+  function finishVerticalViewDrag(dy) {
+    const targetMode = verticalDragTargetMode(dy);
+    const shouldSwitch = targetMode !== state.dragStartViewMode && Math.abs(dy) >= VIEW_DRAG_THRESHOLD_PX;
+    if (shouldSwitch && state.dragStartViewMode === "top" && targetMode === "isometric") {
+      state.azimuth = Math.PI / 2;
+    }
+    const finalMode = shouldSwitch ? targetMode : state.dragStartViewMode;
+    animateViewMode(finalMode, state.dragPreviewTarget || state.dragStartCameraTarget);
+    setViewModeControl(finalMode);
+    state.dragPreviewTarget = null;
+    state.dragTargetViewMode = null;
   }
 
   function updateScaleBar(width) {
@@ -1266,12 +1605,15 @@
     setStatus(
       `${label} ${Math.round(radius)} m · point ${state.focusIndex + 1}/${state.data.flightPath.length}`,
     );
+    updateInfoPanel();
+    const totalMs = performance.now() - start;
     console.log("[terrain] rebuild geometry timing", {
       preview: !!state.data.preview,
-      totalMs: Math.round(performance.now() - start),
+      totalMs: Math.round(totalMs),
       grid: `${state.data.terrain.width}x${state.data.terrain.height}`,
       radius: Math.round(radius),
       resolution: state.data.resolution,
+      qualityMode: state.qualityMode,
     });
   }
 
@@ -1443,6 +1785,7 @@
       state.cutoutRadius = state.maxCutoutRadius;
       state.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10000, 50000);
       installFlightPicker();
+      installSettingsPanel();
       installScrubber();
       // Show overview immediately so first interaction is instant
       const preview = overviewFor(0, state.maxCutoutRadius);

@@ -31,10 +31,11 @@ WMTS_LAYERS = {
     "swissimage": "ch.swisstopo.swissimage",
     "pixelkarte": "ch.swisstopo.pixelkarte-farbe",
 }
+TEXTURE_CACHE_VERSION = "v3"
 
 
-def texture_cache_key(x0: float, y0: float, size_m: int, resolution_m: float, layer: str) -> Path:
-    name = f"tex_{layer}_s{size_m}_r{resolution_m:g}_x{int(x0)}_y{int(y0)}.jpg"
+def texture_cache_key(x0: float, y0: float, width_m: int, height_m: int, resolution_m: float, layer: str) -> Path:
+    name = f"tex_{TEXTURE_CACHE_VERSION}_{layer}_w{width_m}_h{height_m}_r{resolution_m:g}_x{int(x0)}_y{int(y0)}.jpg"
     return WEBGL_TILE_CACHE_DIR / name
 
 
@@ -45,11 +46,22 @@ def download_wmts_tile(row: int, col: int, scale: int, layer: str) -> Image.Imag
     return Image.open(BytesIO(resp.read()))
 
 
-def _build_texture(x0: float, y0: float, size_m: int, resolution_m: float,
-                   scale: int, tw: int, img_px: int, layer: str) -> bytes:
+def _build_texture(
+    x0: float,
+    y0: float,
+    width_m: int,
+    height_m: int,
+    scale: int,
+    tw: int,
+    crop_width_px: int,
+    crop_height_px: int,
+    output_width_px: int,
+    output_height_px: int,
+    layer: str,
+) -> bytes:
     col0 = int((x0 - ORIGIN_X) // tw)
-    col1 = int((x0 + size_m - 1 - ORIGIN_X) // tw)
-    row0 = int((ORIGIN_Y - (y0 + size_m)) // tw)
+    col1 = int((x0 + width_m - 1 - ORIGIN_X) // tw)
+    row0 = int((ORIGIN_Y - (y0 + height_m)) // tw)
     row1 = int((ORIGIN_Y - y0) // tw)
 
     if col0 == col1 and row0 == row1:
@@ -57,8 +69,8 @@ def _build_texture(x0: float, y0: float, size_m: int, resolution_m: float,
         tile_x0 = ORIGIN_X + col0 * tw
         tile_y1 = ORIGIN_Y - row0 * tw
         px = int(round((x0 - tile_x0) / tw * WMTS_TILE_PX))
-        py = int(round((tile_y1 - (y0 + size_m)) / tw * WMTS_TILE_PX))
-        tile = tile.crop((px, py, px + img_px, py + img_px))
+        py = int(round((tile_y1 - (y0 + height_m)) / tw * WMTS_TILE_PX))
+        tile = tile.crop((px, py, px + crop_width_px, py + crop_height_px))
     else:
         n_cols = col1 - col0 + 1
         n_rows = row1 - row0 + 1
@@ -72,9 +84,12 @@ def _build_texture(x0: float, y0: float, size_m: int, resolution_m: float,
                 canvas.paste(tile_img, (c * WMTS_TILE_PX, r * WMTS_TILE_PX))
         tile_x0 = ORIGIN_X + col0 * tw
         tile_y1 = ORIGIN_Y - row0 * tw
-        px = int(round((x0 - tile_x0) / tw * full_w))
-        py = int(round((tile_y1 - (y0 + size_m)) / tw * full_h))
-        tile = canvas.crop((px, py, px + img_px, py + img_px))
+        px = int(round((x0 - tile_x0) / tw * WMTS_TILE_PX))
+        py = int(round((tile_y1 - (y0 + height_m)) / tw * WMTS_TILE_PX))
+        tile = canvas.crop((px, py, px + crop_width_px, py + crop_height_px))
+
+    if tile.size != (output_width_px, output_height_px):
+        tile = tile.resize((output_width_px, output_height_px), Image.Resampling.LANCZOS)
 
     buf = BytesIO()
     tile.save(buf, format="JPEG", quality=85)
@@ -82,9 +97,14 @@ def _build_texture(x0: float, y0: float, size_m: int, resolution_m: float,
 
 
 def texture_for_tile(x0: float, y0: float, size_m: int, resolution_m: float,
-                     layer: str = "swissimage") -> bytes | None:
+                      layer: str = "swissimage") -> bytes | None:
+    return texture_for_region(x0, y0, size_m, size_m, resolution_m, layer)
+
+
+def texture_for_region(x0: float, y0: float, width_m: int, height_m: int, resolution_m: float,
+                       layer: str = "swissimage") -> bytes | None:
     start = perf_counter()
-    cached_path = texture_cache_key(x0, y0, size_m, resolution_m, layer)
+    cached_path = texture_cache_key(x0, y0, width_m, height_m, resolution_m, layer)
     try:
         data = cached_path.read_bytes()
         print(f"[imagery] cache hit {cached_path.name} ({len(data)} bytes) in {(perf_counter() - start) * 1000:.0f} ms",
@@ -95,11 +115,27 @@ def texture_for_tile(x0: float, y0: float, size_m: int, resolution_m: float,
 
     scale = pick_scale(resolution_m)
     tw = SCALE_TILE_WIDTH[scale]
-    img_px = int(round(size_m / resolution_m))
+    source_resolution = tw / WMTS_TILE_PX
+    crop_width_px = max(1, int(round(width_m / source_resolution)))
+    crop_height_px = max(1, int(round(height_m / source_resolution)))
+    output_width_px = max(1, int(round(width_m / resolution_m)))
+    output_height_px = max(1, int(round(height_m / resolution_m)))
 
     source = "downloaded"
     try:
-        data = _build_texture(x0, y0, size_m, resolution_m, scale, tw, img_px, layer)
+        data = _build_texture(
+            x0,
+            y0,
+            width_m,
+            height_m,
+            scale,
+            tw,
+            crop_width_px,
+            crop_height_px,
+            output_width_px,
+            output_height_px,
+            layer,
+        )
     except Exception as e:
         print(f"[imagery] failed for {cached_path.name}: {e}", flush=True)
         return None
@@ -107,6 +143,6 @@ def texture_for_tile(x0: float, y0: float, size_m: int, resolution_m: float,
     WEBGL_TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cached_path.write_bytes(data)
     ms = (perf_counter() - start) * 1000
-    print(f"[imagery] {source} {cached_path.name} ({len(data)} bytes, scale={scale}, img={img_px}px) in {ms:.0f} ms",
-          flush=True)
+    print(f"[imagery] {source} {cached_path.name} ({len(data)} bytes, scale={scale}, crop={crop_width_px}x{crop_height_px}px img={output_width_px}x{output_height_px}px) in {ms:.0f} ms",
+           flush=True)
     return data

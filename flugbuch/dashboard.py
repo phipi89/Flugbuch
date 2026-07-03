@@ -9,13 +9,13 @@ from time import perf_counter
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from .flight import FlightCollection, PROJECT_ROOT, load_flight
-from .imagery import texture_for_tile
+from .imagery import texture_for_region
 from .landcover import landcover_overlay
 from .terrain import adaptive_terrain_around_path, full_flight_circle, webgl_local_terrain_payload, webgl_terrain_payload, webgl_tile_payload
 
 
 OVERVIEW_CACHE_DIR = PROJECT_ROOT / "cache" / "webgl_overviews"
-OVERVIEW_CACHE_VERSION = "v3"
+OVERVIEW_CACHE_VERSION = "v4"
 OVERVIEW_TERRAIN_GRID_SIDE = 240
 OVERVIEW_PAYLOAD_GRID_SIDE = 220
 MIN_RADIUS = 1500
@@ -106,6 +106,10 @@ def flight_page_payload(label: str | None = None) -> tuple[str, str, str]:
     metadata = {
         "flightPath": flight.xyz.astype(float).tolist(),
         "timeSeconds": cumulative_seconds,
+        "terrainAltitude": flight.terrain_altitude.astype(float).tolist(),
+        "heightAboveGround": flight.height_above_ground.astype(float).tolist(),
+        "groundSpeedMs": flight.ground_speed_ms.astype(float).tolist(),
+        "verticalSpeedMs": flight.velocity[:, 2].astype(float).tolist(),
         "sun": {
             "startAzimuth": float(flight.sun_azimuth[0]),
             "endAzimuth": float(flight.sun_azimuth[-1]),
@@ -223,16 +227,18 @@ def create_app() -> Flask:
         y0 = float(request.args["y0"])
         resolution = float(request.args.get("resolution", 5))
         size = int(request.args.get("size", 1000))
+        width = int(request.args.get("width", size))
+        height = int(request.args.get("height", size))
         layer = request.args.get("layer", "swissimage")
         if layer not in ("swissimage", "pixelkarte"):
             return Response(status=400)
         start = perf_counter()
-        data = texture_for_tile(x0, y0, size, resolution, layer)
+        data = texture_for_region(x0, y0, width, height, resolution, layer)
         ms = (perf_counter() - start) * 1000
         if data is None:
-            print(f"[terrain] texture MISS  x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={size} layer={layer} ({ms:.0f} ms)", flush=True)
+            print(f"[terrain] texture MISS  x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={width}x{height} layer={layer} ({ms:.0f} ms)", flush=True)
             return Response(status=404)
-        print(f"[terrain] texture HIT   x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={size} layer={layer} ({len(data)} bytes, {ms:.0f} ms)", flush=True)
+        print(f"[terrain] texture HIT   x0={x0:.0f} y0={y0:.0f} res={resolution:.0f} size={width}x{height} layer={layer} ({len(data)} bytes, {ms:.0f} ms)", flush=True)
         return Response(data, mimetype="image/jpeg")
 
     @app.get("/terrain-overlay")
@@ -272,7 +278,16 @@ def create_app() -> Flask:
                     #flight-picker-list.open {{ display: block; }}
                     .flight-option {{ display: block; width: 100%; border: 0; border-bottom: 1px solid rgba(148,163,184,.18); padding: 8px 10px; color: #e5e7eb; background: transparent; text-align: left; font-size: 12px; cursor: pointer; }}
                     .flight-option:hover {{ background: rgba(148,163,184,.18); }}
+                    #settings {{ position: fixed; top: 40px; right: 16px; z-index: 4; color: #e5e7eb; font-size: 12px; }}
+                    #settings-button {{ color: #e5e7eb; background: rgba(15,23,42,.72); border: 1px solid rgba(148,163,184,.45); border-radius: 8px; padding: 6px 10px; cursor: pointer; }}
+                    #settings-panel {{ display: none; min-width: 220px; margin-top: 6px; padding: 10px; background: rgba(15,23,42,.9); border: 1px solid rgba(148,163,184,.35); border-radius: 10px; box-shadow: 0 14px 40px rgba(15,23,42,.35); }}
+                    #settings-panel.open {{ display: block; }}
+                    #settings-panel label {{ display: block; margin-bottom: 10px; }}
+                    #settings-panel select {{ width: 100%; margin-top: 4px; color: #e5e7eb; background: rgba(15,23,42,.96); border: 1px solid rgba(148,163,184,.45); border-radius: 6px; padding: 5px; }}
                     #flight-label {{ position: fixed; right: 16px; bottom: 14px; z-index: 2; color: #cbd5e1; font-size: 12px; }}
+                    #flight-info {{ position: fixed; left: 16px; bottom: 48px; z-index: 3; color: #e5e7eb; background: rgba(15,23,42,.68); border: 1px solid rgba(148,163,184,.25); border-radius: 10px; padding: 9px 11px; font-size: 12px; line-height: 1.45; text-shadow: 0 1px 2px #020617; backdrop-filter: blur(4px); }}
+                    #flight-info div {{ display: flex; justify-content: space-between; gap: 18px; min-width: 122px; }}
+                    #flight-info span:first-child {{ color: #94a3b8; }}
                     #scrub {{ position: fixed; left: 16px; right: 16px; bottom: 18px; z-index: 3; accent-color: #f59e0b; }}
                     #help {{ position: fixed; top: 14px; right: 16px; z-index: 2; color: #94a3b8; font-size: 12px; }}
                     #scale {{ position: fixed; right: 16px; bottom: 48px; z-index: 3; color: #e5e7eb; font-size: 12px; text-align: center; text-shadow: 0 1px 2px #020617; }}
@@ -282,8 +297,33 @@ def create_app() -> Flask:
             <body>
                 <div id="terrain-status">Loading renderer...</div>
                 <div id="flight-picker"><button id="flight-picker-button" type="button">Flights</button><div id="flight-picker-list"></div></div>
+                <div id="settings">
+                    <button id="settings-button" type="button">Settings</button>
+                    <div id="settings-panel">
+                        <label><input id="settings-landcover" type="checkbox" checked> Landcover overlay</label>
+                        <label>Terrain style
+                            <select id="settings-terrain-layer">
+                                <option value="slope">Slope colors</option>
+                                <option value="swissimage">swissimage</option>
+                                <option value="pixelkarte">karte</option>
+                            </select>
+                        </label>
+                        <label>View
+                            <select id="settings-view-mode">
+                                <option value="isometric">3D</option>
+                                <option value="top">Top</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
                 <div id="help">drag left/right to rotate · wheel to zoom · scrub along flight</div>
                 <div id="terrain-viewer"></div>
+                <div id="flight-info">
+                    <div><span>ASL</span><strong id="info-asl">-</strong></div>
+                    <div><span>AGL</span><strong id="info-agl">-</strong></div>
+                    <div><span>Speed</span><strong id="info-speed">-</strong></div>
+                    <div><span>Vario</span><strong id="info-vario">-</strong></div>
+                </div>
                 <div id="flight-label">{flight_label}</div>
                 <div id="scale"><div id="scale-bar"></div><div>1 km</div></div>
                 <input id="scrub" type="range" min="0" max="0" value="0" step="1">
