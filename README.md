@@ -2,7 +2,7 @@
 
 An experimental, work in progress (!), interactive paragliding flight log viewer.
 
-<video src="docs/media/terrain-demo.mp4" controls autoplay loop muted playsinline></video>
+<video src="https://github.com/user-attachments/assets/a6fa243a-081a-46a1-857c-351fe3f5e71d" autoplay loop muted></video>
 
 ## Features
 
