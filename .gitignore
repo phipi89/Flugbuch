@@ -8,9 +8,13 @@ flugbuch-venv/
 
 .ipynb_checkpoints/
 *.ipynb
+*.code-workspace
+sync_vario.sh
 
 cache/
 LOGS/
+Wetter/
+old/
 image_cache.sqlite
 *.pkl
 
